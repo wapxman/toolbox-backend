@@ -6,6 +6,7 @@ const authRoutes = require('./routes/auth');
 const boxRoutes = require('./routes/boxes');
 const toolRoutes = require('./routes/tools');
 const rentalRoutes = require('./routes/rentals');
+const notificationRoutes = require('./routes/notifications');
 
 const app = express();
 
@@ -27,6 +28,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/boxes', boxRoutes);
 app.use('/api/tools', toolRoutes);
 app.use('/api/rentals', rentalRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
@@ -34,7 +36,13 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Что-то пошло не так' });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n  ToolBox API запущен: http://localhost:${PORT}\n`);
-});
+// Для Vercel — экспортируем app
+module.exports = app;
+
+// Для локальной разработки — запускаем сервер
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`\n  ToolBox API запущен: http://localhost:${PORT}\n`);
+  });
+}
