@@ -3,19 +3,15 @@ const supabase = require('../lib/supabase');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
-
-// Все rental-эндпоинты требуют авторизации
 router.use(auth);
 
-// Расчёт цены с учётом скидок
 function calculatePrice(dayPrice, days) {
-  if (days >= 7) return Math.round(days * dayPrice * 0.65); // скидка 35%
-  if (days >= 3) return Math.round(days * dayPrice * 0.80); // скидка 20%
+  if (days >= 7) return Math.round(days * dayPrice * 0.65);
+  if (days >= 3) return Math.round(days * dayPrice * 0.80);
   return days * dayPrice;
 }
 
-// POST /api/rentals
-// Создать аренду
+// POST /api/rentals — создать аренду
 router.post('/', async (req, res) => {
   try {
     const { tool_id, days } = req.body;
@@ -24,7 +20,17 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Укажите инструмент и количество дней (1-30)' });
     }
 
-    // Получаем инструмент
+    // Проверяем лимит активных аренд
+    const { count: activeCount } = await supabase
+      .from('rentals')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.userId)
+      .in('status', ['active', 'overdue']);
+
+    if (activeCount >= 3) {
+      return res.status(400).json({ error: 'Максимум 3 активных аренды одновременно' });
+    }
+
     const { data: tool, error: toolErr } = await supabase
       .from('tools')
       .select('*, cells(*)')
@@ -39,15 +45,11 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Инструмент уже занят' });
     }
 
-    // Рассчитываем цену
     const totalPrice = calculatePrice(tool.day_price, days);
-
-    // Рассчитываем дату окончания
     const startedAt = new Date();
     const expectedEnd = new Date(startedAt);
     expectedEnd.setDate(expectedEnd.getDate() + days);
 
-    // Создаём аренду
     const { data: rental, error: rentalErr } = await supabase
       .from('rentals')
       .insert({
@@ -64,11 +66,19 @@ router.post('/', async (req, res) => {
 
     if (rentalErr) throw rentalErr;
 
-    // Обновляем статус ячейки
     await supabase
       .from('cells')
       .update({ status: 'occupied' })
       .eq('id', tool.cell_id);
+
+    // Уведомление о создании аренды
+    await supabase.from('notifications').insert({
+      user_id: req.userId,
+      rental_id: rental.id,
+      type: 'payment',
+      title: 'Аренда создана',
+      message: `${tool.name} — ${days} ${days === 1 ? 'день' : days < 5 ? 'дня' : 'дней'}, ${totalPrice.toLocaleString('ru-RU')} сум`
+    });
 
     res.json({
       rental,
@@ -83,19 +93,15 @@ router.post('/', async (req, res) => {
 });
 
 // GET /api/rentals/active
-// Активные аренды пользователя
 router.get('/active', async (req, res) => {
   try {
-    const { data: rentals, error } = await supabase
+    const { data, error } = await supabase
       .from('rentals')
       .select(`
         *,
         tools (
           name, category, brand, photo_url, day_price,
-          cells (
-            cell_number,
-            boxes ( name, address )
-          )
+          cells ( cell_number, boxes ( name, address ) )
         )
       `)
       .eq('user_id', req.userId)
@@ -103,7 +109,7 @@ router.get('/active', async (req, res) => {
       .order('started_at', { ascending: false });
 
     if (error) throw error;
-    res.json(rentals);
+    res.json(data);
   } catch (err) {
     console.error('active rentals error:', err);
     res.status(500).json({ error: 'Ошибка загрузки аренд' });
@@ -111,31 +117,51 @@ router.get('/active', async (req, res) => {
 });
 
 // GET /api/rentals/history
-// История аренд
 router.get('/history', async (req, res) => {
   try {
-    const { data: rentals, error } = await supabase
+    const { data, error } = await supabase
       .from('rentals')
-      .select(`
-        *,
-        tools (
-          name, category, brand, photo_url, day_price
-        )
-      `)
+      .select(`*, tools ( name, category, brand, photo_url, day_price )`)
       .eq('user_id', req.userId)
       .eq('status', 'completed')
       .order('started_at', { ascending: false });
 
     if (error) throw error;
-    res.json(rentals);
+    res.json(data);
   } catch (err) {
     console.error('rental history error:', err);
     res.status(500).json({ error: 'Ошибка загрузки истории' });
   }
 });
 
+// GET /api/rentals/:id — детали одной аренды
+router.get('/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('rentals')
+      .select(`
+        *,
+        tools (
+          name, category, brand, photo_url, day_price, specs,
+          cells ( cell_number, qr_code, boxes ( id, name, address ) )
+        )
+      `)
+      .eq('id', req.params.id)
+      .eq('user_id', req.userId)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: 'Аренда не найдена' });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('rental detail error:', err);
+    res.status(500).json({ error: 'Ошибка' });
+  }
+});
+
 // POST /api/rentals/:id/extend
-// Продлить аренду
 router.post('/:id/extend', async (req, res) => {
   try {
     const { extra_days } = req.body;
@@ -146,7 +172,7 @@ router.post('/:id/extend', async (req, res) => {
 
     const { data: rental, error: rErr } = await supabase
       .from('rentals')
-      .select('*, tools(day_price)')
+      .select('*, tools(day_price, name)')
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
@@ -178,11 +204,16 @@ router.post('/:id/extend', async (req, res) => {
 
     if (uErr) throw uErr;
 
-    res.json({
-      rental: updated,
-      extra_price: extraPrice,
-      message: `Аренда продлена на ${extra_days} дн.`
+    // Уведомление о продлении
+    await supabase.from('notifications').insert({
+      user_id: req.userId,
+      rental_id: rental.id,
+      type: 'payment',
+      title: 'Аренда продлена',
+      message: `${rental.tools.name} — +${extra_days} дн., доплата ${extraPrice.toLocaleString('ru-RU')} сум`
     });
+
+    res.json({ rental: updated, extra_price: extraPrice, message: `Аренда продлена на ${extra_days} дн.` });
   } catch (err) {
     console.error('extend error:', err);
     res.status(500).json({ error: 'Ошибка продления' });
@@ -190,7 +221,6 @@ router.post('/:id/extend', async (req, res) => {
 });
 
 // POST /api/rentals/:id/return
-// Вернуть инструмент
 router.post('/:id/return', async (req, res) => {
   try {
     const { data: rental, error: rErr } = await supabase
@@ -208,7 +238,6 @@ router.post('/:id/return', async (req, res) => {
       return res.status(400).json({ error: 'Уже возвращён' });
     }
 
-    // Проверяем просрочку
     const now = new Date();
     const expectedEnd = new Date(rental.expected_end);
     let overdueFee = 0;
@@ -218,7 +247,6 @@ router.post('/:id/return', async (req, res) => {
       overdueFee = Math.round(overdueDays * (rental.total_price / rental.days) * 1.5);
     }
 
-    // Завершаем аренду
     const { data: updated, error: uErr } = await supabase
       .from('rentals')
       .update({
@@ -232,11 +260,21 @@ router.post('/:id/return', async (req, res) => {
 
     if (uErr) throw uErr;
 
-    // Освобождаем ячейку
     await supabase
       .from('cells')
       .update({ status: 'free' })
       .eq('id', rental.tools.cell_id);
+
+    // Уведомление о возврате
+    await supabase.from('notifications').insert({
+      user_id: req.userId,
+      rental_id: rental.id,
+      type: 'info',
+      title: overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
+      message: overdueFee > 0
+        ? `${rental.tools.name} — штраф ${overdueFee.toLocaleString('ru-RU')} сум`
+        : `${rental.tools.name} — спасибо за использование ToolBox!`
+    });
 
     res.json({
       rental: updated,
