@@ -1,5 +1,6 @@
 const express = require('express');
 const supabase = require('../lib/supabase');
+const kerong = require('../lib/kerong');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -11,7 +12,7 @@ function calculatePrice(dayPrice, days) {
   return days * dayPrice;
 }
 
-// POST /api/rentals — создать аренду
+// POST /api/rentals — создать аренду + открыть замок
 router.post('/', async (req, res) => {
   try {
     const { tool_id, days } = req.body;
@@ -20,7 +21,6 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Укажите инструмент и количество дней (1-30)' });
     }
 
-    // Проверяем лимит активных аренд
     const { count: activeCount } = await supabase
       .from('rentals')
       .select('*', { count: 'exact', head: true })
@@ -33,7 +33,7 @@ router.post('/', async (req, res) => {
 
     const { data: tool, error: toolErr } = await supabase
       .from('tools')
-      .select('*, cells(*)')
+      .select('*, cells(*, boxes(*))')
       .eq('id', tool_id)
       .single();
 
@@ -49,6 +49,11 @@ router.post('/', async (req, res) => {
     const startedAt = new Date();
     const expectedEnd = new Date(startedAt);
     expectedEnd.setDate(expectedEnd.getDate() + days);
+
+    // Открываем замок через Kerong
+    const zoneId = tool.cells.boxes.kerong_zone_id || 1;
+    const lockNumber = tool.cells.cell_number;
+    await kerong.openLock(zoneId, lockNumber);
 
     const { data: rental, error: rentalErr } = await supabase
       .from('rentals')
@@ -71,7 +76,6 @@ router.post('/', async (req, res) => {
       .update({ status: 'occupied' })
       .eq('id', tool.cell_id);
 
-    // Уведомление о создании аренды
     await supabase.from('notifications').insert({
       user_id: req.userId,
       rental_id: rental.id,
@@ -84,7 +88,8 @@ router.post('/', async (req, res) => {
       rental,
       tool_name: tool.name,
       total_price: totalPrice,
-      message: 'Аренда создана. Оплатите для получения инструмента.'
+      lock_opened: true,
+      message: 'Замок открыт! Заберите инструмент.'
     });
   } catch (err) {
     console.error('create rental error:', err);
@@ -134,7 +139,7 @@ router.get('/history', async (req, res) => {
   }
 });
 
-// GET /api/rentals/:id — детали одной аренды
+// GET /api/rentals/:id
 router.get('/:id', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -204,7 +209,6 @@ router.post('/:id/extend', async (req, res) => {
 
     if (uErr) throw uErr;
 
-    // Уведомление о продлении
     await supabase.from('notifications').insert({
       user_id: req.userId,
       rental_id: rental.id,
@@ -220,12 +224,12 @@ router.post('/:id/extend', async (req, res) => {
   }
 });
 
-// POST /api/rentals/:id/return
+// POST /api/rentals/:id/return — вернуть инструмент + открыть замок
 router.post('/:id/return', async (req, res) => {
   try {
     const { data: rental, error: rErr } = await supabase
       .from('rentals')
-      .select('*, tools(cell_id, name)')
+      .select('*, tools(cell_id, name, cells(cell_number, boxes(kerong_zone_id)))')
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
@@ -237,6 +241,11 @@ router.post('/:id/return', async (req, res) => {
     if (rental.status === 'completed') {
       return res.status(400).json({ error: 'Уже возвращён' });
     }
+
+    // Открываем замок для возврата через Kerong
+    const zoneId = rental.tools.cells.boxes.kerong_zone_id || 1;
+    const lockNumber = rental.tools.cells.cell_number;
+    await kerong.openLock(zoneId, lockNumber);
 
     const now = new Date();
     const expectedEnd = new Date(rental.expected_end);
@@ -265,7 +274,6 @@ router.post('/:id/return', async (req, res) => {
       .update({ status: 'free' })
       .eq('id', rental.tools.cell_id);
 
-    // Уведомление о возврате
     await supabase.from('notifications').insert({
       user_id: req.userId,
       rental_id: rental.id,
@@ -279,10 +287,10 @@ router.post('/:id/return', async (req, res) => {
     res.json({
       rental: updated,
       overdue_fee: overdueFee,
-      tool_name: rental.tools.name,
+      lock_opened: true,
       message: overdueFee > 0
-        ? `Возвращён со штрафом ${overdueFee} сум за просрочку`
-        : 'Инструмент возвращён. Спасибо!'
+        ? `Замок открыт. Штраф ${overdueFee} сум за просрочку`
+        : 'Замок открыт. Верните инструмент в ячейку. Спасибо!'
     });
   } catch (err) {
     console.error('return error:', err);
