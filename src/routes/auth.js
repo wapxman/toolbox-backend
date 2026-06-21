@@ -46,16 +46,25 @@ router.post('/verify', async (req, res) => {
       return res.status(400).json({ error: 'Укажите номер и код' });
     }
 
-    const stored = codes.get(phone);
-    if (!stored || stored.code !== code) {
-      return res.status(401).json({ error: 'Неверный код' });
-    }
-    if (Date.now() > stored.expires) {
-      codes.delete(phone);
-      return res.status(401).json({ error: 'Код истёк, запросите новый' });
-    }
+    // DEV-вход: пока SMS в режиме console (реальные SMS не подключены),
+    // принимаем мастер-код для тестирования без получения СМС.
+    // Как только SMS_PROVIDER станет реальным (eskiz/playmobile) — мастер-код
+    // автоматически перестанет работать.
+    const smsProvider = process.env.SMS_PROVIDER || 'console';
+    const isDevMaster =
+      smsProvider === 'console' && code === (process.env.DEV_LOGIN_CODE || '0000');
 
-    codes.delete(phone);
+    if (!isDevMaster) {
+      const stored = codes.get(phone);
+      if (!stored || stored.code !== code) {
+        return res.status(401).json({ error: 'Неверный код' });
+      }
+      if (Date.now() > stored.expires) {
+        codes.delete(phone);
+        return res.status(401).json({ error: 'Код истёк, запросите новый' });
+      }
+      codes.delete(phone);
+    }
 
     // Ищем или создаём пользователя
     let { data: user } = await supabase
