@@ -154,6 +154,16 @@ adb install -r ToolBox.apk
 - [ ] Восстановить из старой APK v6.9: Firebase-пуши, геолокацию «боксы рядом»
 - [ ] Уведомления: окончание аренды, просрочка
 
+**iOS-версия (у пользователя есть Mac — собираем на нём через Xcode):**
+- [ ] `flutter create --platforms=ios .` — сгенерировать папку `ios/`
+- [ ] Ключ Яндекс MapKit в iOS (AppDelegate/Info.plist), CocoaPods `pod install`
+- [ ] Разрешение камеры: `NSCameraUsageDescription` в Info.plist (для QR)
+- [ ] `NSLocationWhenInUseUsageDescription` для геолокации
+- [ ] Apple Developer аккаунт ($99/год) → подпись → TestFlight → App Store
+- [ ] Сборка: `flutter build ios` / `flutter build ipa` на Mac
+- Примечание: iOS собирается ТОЛЬКО на Mac (Xcode). Весь Dart-код кросс-платформенный,
+  переписывать не нужно — только платформенная настройка iOS.
+
 **После пилота:**
 - [ ] Публикация в Google Play (.aab), вторая точка
 
