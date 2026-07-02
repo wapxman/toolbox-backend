@@ -6,8 +6,8 @@ const auth = require('../middleware/auth');
 
 const router = express.Router();
 
-// Хранилище кодов (в MVP — в памяти)
-const codes = new Map();
+// Коды хранятся в Supabase (таблица sms_codes) — in-memory Map не переживает
+// serverless-инстансы Vercel: send-code и verify могут попасть на разные инстансы.
 
 // POST /api/auth/send-code
 router.post('/send-code', async (req, res) => {
@@ -19,14 +19,30 @@ router.post('/send-code', async (req, res) => {
     }
 
     // Rate limit: 1 код в 60 сек
-    const existing = codes.get(phone);
-    if (existing && Date.now() - existing.created < 60000) {
-      const wait = Math.ceil((60000 - (Date.now() - existing.created)) / 1000);
-      return res.status(429).json({ error: `Подождите ${wait} сек перед повторной отправкой` });
+    const { data: existing } = await supabase
+      .from('sms_codes')
+      .select('created_at')
+      .eq('phone', phone)
+      .single();
+
+    if (existing) {
+      const elapsed = Date.now() - new Date(existing.created_at).getTime();
+      if (elapsed < 60000) {
+        const wait = Math.ceil((60000 - elapsed) / 1000);
+        return res.status(429).json({ error: `Подождите ${wait} сек перед повторной отправкой` });
+      }
     }
 
     const code = Math.floor(1000 + Math.random() * 9000).toString();
-    codes.set(phone, { code, created: Date.now(), expires: Date.now() + 5 * 60 * 1000 });
+    const { error: upsertError } = await supabase
+      .from('sms_codes')
+      .upsert({
+        phone,
+        code,
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      });
+    if (upsertError) throw upsertError;
 
     await sendSmsCode(phone, code);
 
@@ -55,15 +71,20 @@ router.post('/verify', async (req, res) => {
       smsProvider === 'console' && code === (process.env.DEV_LOGIN_CODE || '0000');
 
     if (!isDevMaster) {
-      const stored = codes.get(phone);
+      const { data: stored } = await supabase
+        .from('sms_codes')
+        .select('code, expires_at')
+        .eq('phone', phone)
+        .single();
+
       if (!stored || stored.code !== code) {
         return res.status(401).json({ error: 'Неверный код' });
       }
-      if (Date.now() > stored.expires) {
-        codes.delete(phone);
+      if (Date.now() > new Date(stored.expires_at).getTime()) {
+        await supabase.from('sms_codes').delete().eq('phone', phone);
         return res.status(401).json({ error: 'Код истёк, запросите новый' });
       }
-      codes.delete(phone);
+      await supabase.from('sms_codes').delete().eq('phone', phone);
     }
 
     // Ищем или создаём пользователя
