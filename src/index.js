@@ -8,6 +8,7 @@ const toolRoutes = require('./routes/tools');
 const rentalRoutes = require('./routes/rentals');
 const notificationRoutes = require('./routes/notifications');
 const lockRoutes = require('./routes/locks');
+const paymeRoutes = require('./routes/payme');
 const kerong = require('./lib/kerong');
 
 const app = express();
@@ -33,6 +34,7 @@ app.use('/api/tools', toolRoutes);
 app.use('/api/rentals', rentalRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/locks', lockRoutes);
+app.use('/api/payments/payme', paymeRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {

@@ -50,11 +50,8 @@ router.post('/', async (req, res) => {
     const expectedEnd = new Date(startedAt);
     expectedEnd.setDate(expectedEnd.getDate() + days);
 
-    // Открываем замок через Kerong
-    const zoneId = tool.cells.boxes.kerong_zone_id || 1;
-    const lockNumber = tool.cells.cell_number;
-    await kerong.openLock(zoneId, lockNumber);
-
+    // Аренда создаётся в статусе pending_payment.
+    // Замок откроется в Payme PerformTransaction — после реальной оплаты.
     const { data: rental, error: rentalErr } = await supabase
       .from('rentals')
       .insert({
@@ -63,7 +60,7 @@ router.post('/', async (req, res) => {
         days: days,
         started_at: startedAt.toISOString(),
         expected_end: expectedEnd.toISOString(),
-        status: 'active',
+        status: 'pending_payment',
         total_price: totalPrice
       })
       .select()
@@ -71,29 +68,59 @@ router.post('/', async (req, res) => {
 
     if (rentalErr) throw rentalErr;
 
+    // Резервируем ячейку на время оплаты
     await supabase
       .from('cells')
       .update({ status: 'occupied' })
       .eq('id', tool.cell_id);
 
-    await supabase.from('notifications').insert({
-      user_id: req.userId,
-      rental_id: rental.id,
-      type: 'payment',
-      title: 'Аренда создана',
-      message: `${tool.name} — ${days} ${days === 1 ? 'день' : days < 5 ? 'дня' : 'дней'}, ${totalPrice.toLocaleString('ru-RU')} сум`
-    });
-
     res.json({
       rental,
       tool_name: tool.name,
       total_price: totalPrice,
-      lock_opened: true,
-      message: 'Замок открыт! Заберите инструмент.'
+      payment_url: buildPaymeUrl(rental.id, totalPrice),
+      message: 'Аренда создана. Оплатите, чтобы открыть замок.'
     });
   } catch (err) {
     console.error('create rental error:', err);
     res.status(500).json({ error: 'Ошибка создания аренды' });
+  }
+});
+
+// Ссылка на оплату Payme: base64(m=MERCHANT_ID;ac.rental_id=ID;a=СУММА_В_ТИЙИНАХ)
+function buildPaymeUrl(rentalId, priceSum) {
+  const merchantId = process.env.PAYME_MERCHANT_ID;
+  if (!merchantId) return null;
+  const base = process.env.PAYME_CHECKOUT_URL || 'https://checkout.paycom.uz';
+  const payload = `m=${merchantId};ac.rental_id=${rentalId};a=${priceSum * 100}`;
+  return `${base}/${Buffer.from(payload).toString('base64')}`;
+}
+
+// GET /api/rentals/:id/payment-status — поллинг оплаты из приложения
+router.get('/:id/payment-status', async (req, res) => {
+  try {
+    const { data: rental, error } = await supabase
+      .from('rentals')
+      .select('id, status, total_price')
+      .eq('id', req.params.id)
+      .eq('user_id', req.userId)
+      .single();
+
+    if (error || !rental) {
+      return res.status(404).json({ error: 'Аренда не найдена' });
+    }
+
+    res.json({
+      rental_id: rental.id,
+      status: rental.status,
+      paid: rental.status === 'active',
+      payment_url: rental.status === 'pending_payment'
+        ? buildPaymeUrl(rental.id, rental.total_price)
+        : null
+    });
+  } catch (err) {
+    console.error('payment-status error:', err);
+    res.status(500).json({ error: 'Ошибка проверки оплаты' });
   }
 });
 
