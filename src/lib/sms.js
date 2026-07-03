@@ -70,7 +70,7 @@ async function sendSmsCode(phone, code) {
 
   if (provider === 'eskiz') {
     // Текст должен совпадать с шаблоном, одобренным в кабинете Eskiz
-    const message = `ToolBox: kod podtverzhdeniya ${code}. Nikomu ne soobshchayte.`;
+    const message = `Kod dlya vhoda v mobilnoe prilozhenie ToolBox: ${code}. Nikomu ne soobshchayte.`;
     return eskizSend(phone, message);
   }
 
