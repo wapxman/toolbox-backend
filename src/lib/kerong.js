@@ -20,15 +20,15 @@ let tokenExpiry = 0;
 
 /**
  * Получить JWT-токен от Kerong LCS
- * POST /api/v1/auth/login
+ * POST /api/v1/auth/v2/login (раздел 7.2 документации LCS)
  */
 async function getToken() {
   if (MOCK_MODE) return 'mock-token';
-  
+
   // Кэшируем токен на 50 минут (LCS выдаёт на 60)
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
 
-  const res = await fetch(`${KERONG_URL}/api/v1/auth/login`, {
+  const res = await fetch(`${KERONG_URL}/api/v1/auth/v2/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username: KERONG_USER, password: KERONG_PASS })
@@ -139,8 +139,8 @@ async function createBooking({ lockNumber, zoneId, startDate, endDate }) {
 }
 
 /**
- * Завершить аренду в Kerong LCS (замок откроется автоматически)
- * POST /api/v1/booking/{uuid}/complete
+ * Завершить аренду в Kerong LCS (active=false, конец аренды = сейчас)
+ * PATCH /api/v1/booking/active/{uuid} (раздел 6.12 документации LCS)
  */
 async function completeBooking(bookingUuid) {
   if (MOCK_MODE) {
@@ -148,7 +148,7 @@ async function completeBooking(bookingUuid) {
     return { success: true, mock: true };
   }
 
-  return kerongRequest('POST', `/booking/${bookingUuid}/complete`);
+  return kerongRequest('PATCH', `/booking/active/${bookingUuid}`);
 }
 
 /**
