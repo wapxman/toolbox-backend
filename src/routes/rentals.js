@@ -256,7 +256,7 @@ router.post('/:id/return', async (req, res) => {
   try {
     const { data: rental, error: rErr } = await supabase
       .from('rentals')
-      .select('*, tools(cell_id, name, cells(cell_number, boxes(kerong_zone_id)))')
+      .select('*, tools(cell_id, name, cells(cell_number, kerong_lock_number, boxes(kerong_zone_id)))')
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
@@ -270,8 +270,9 @@ router.post('/:id/return', async (req, res) => {
     }
 
     // Открываем замок для возврата через Kerong
-    const zoneId = rental.tools.cells.boxes.kerong_zone_id || 1;
-    const lockNumber = rental.tools.cells.cell_number;
+    const cell = rental.tools.cells;
+    const zoneId = cell.boxes.kerong_zone_id || 1;
+    const lockNumber = cell.kerong_lock_number ?? (cell.cell_number - 1);
     await kerong.openLock(zoneId, lockNumber);
 
     const now = new Date();

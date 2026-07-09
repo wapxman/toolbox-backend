@@ -1,83 +1,67 @@
 /**
- * Kerong LCS API Client
- * Модуль для управления электрозамками через Kerong LCS сервер.
- * 
- * Документация: ДОКУМЕНТАЦИЯ_KERONG_API_LCS.pdf (300 стр.)
- * Используем 6 эндпоинтов из ~100+
- * 
- * Режим работы:
- * - MOCK=true  → замки не открываются, логи в консоль (разработка)
- * - MOCK=false → реальные запросы к Kerong LCS (продакшн)
+ * Kerong LCS API Client (docker-версия kerong-api v2.4.5)
+ *
+ * ВАЖНО: docker-образ kerong-api имеет СВОЙ API (/kerong-api/*), он НЕ совпадает
+ * с большим LCS из PDF-документации (там был /api/v1/auth, /zones/* — их тут НЕТ).
+ * Реальные эндпоинты выверены живьём 10.07.2026 (замок открыт по сети).
+ *
+ * Режим:
+ * - KERONG_LCS_URL не задан → MOCK (замок не открывается, лог в консоль)
+ * - KERONG_LCS_URL задан    → реальные запросы к LCS (через Cloudflare Tunnel)
+ *
+ * Плата KR-BU: сетевой модуль, заводской статический IP 192.168.0.7:23.
+ * LCS держит с ней TCP-соединение и транслирует HTTP → бинарный протокол платы.
  */
 
-const KERONG_URL = process.env.KERONG_LCS_URL || 'http://localhost:9777';
-const KERONG_USER = process.env.KERONG_LCS_USER || 'admin';
-const KERONG_PASS = process.env.KERONG_LCS_PASSWORD || 'masterkey';
-const MOCK_MODE = !process.env.KERONG_LCS_URL; // мок если URL не задан
+const KERONG_URL = (process.env.KERONG_LCS_URL || '').replace(/\/+$/, '');
+const BOARD_IP = process.env.KERONG_BOARD_IP || '192.168.0.7';
+const BOARD_PORT = parseInt(process.env.KERONG_BOARD_PORT || '23', 10);
+const BOARD_TYPE = process.env.KERONG_BOARD_TYPE || 'CU_16';
+const MOCK_MODE = !KERONG_URL;
 
-let cachedToken = null;
-let tokenExpiry = 0;
+// uuid платы в LCS генерится при создании — кэшируем после первого резолва
+let cachedBuUuid = null;
 
-/**
- * Получить JWT-токен от Kerong LCS
- * POST /api/v1/auth/v2/login (раздел 7.2 документации LCS)
- */
-async function getToken() {
-  if (MOCK_MODE) return 'mock-token';
-
-  // Кэшируем токен на 50 минут (LCS выдаёт на 60)
-  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-
-  const res = await fetch(`${KERONG_URL}/api/v1/auth/v2/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: KERONG_USER, password: KERONG_PASS })
-  });
-
-  if (!res.ok) throw new Error(`Kerong auth failed: ${res.status}`);
-  
-  const data = await res.json();
-  cachedToken = data.accessToken;
-  tokenExpiry = Date.now() + 50 * 60 * 1000;
-  return cachedToken;
+async function api(method, path, body = null) {
+  const opts = { method, headers: {} };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(`${KERONG_URL}/kerong-api${path}`, opts);
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!res.ok) {
+    throw new Error(`Kerong LCS ${res.status}: ${text || res.statusText}`);
+  }
+  return data;
 }
 
 /**
- * Выполнить запрос к Kerong LCS API
+ * Найти (или создать) плату KR-BU в LCS и вернуть её uuid.
+ * LCS хранит платы в своей БД; если её нет — регистрируем по заводскому IP.
  */
-async function kerongRequest(method, path, body = null) {
-  if (MOCK_MODE) {
-    console.log(`[KERONG MOCK] ${method} ${path}`, body || '');
-    return { mock: true };
+async function resolveBoardUuid() {
+  if (cachedBuUuid) return cachedBuUuid;
+
+  const list = await api('GET', '/kr-bu-boards-list');
+  const existing = Array.isArray(list) ? list.find(b => b.address === BOARD_IP) : null;
+  if (existing) {
+    cachedBuUuid = existing.uuid;
+    return cachedBuUuid;
   }
 
-  const token = await getToken();
-  const options = {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
-    }
-  };
-  if (body) options.body = JSON.stringify(body);
-
-  const res = await fetch(`${KERONG_URL}/api/v1${path}`, options);
-  
-  if (res.status === 401) {
-    // Токен протух — сбрасываем и пробуем ещё раз
-    cachedToken = null;
-    tokenExpiry = 0;
-    return kerongRequest(method, path, body);
-  }
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Kerong API error ${res.status}: ${err}`);
-  }
-
-  // Некоторые эндпоинты возвращают пустой body (open-lock → 200 без тела)
-  const text = await res.text();
-  return text ? JSON.parse(text) : {};
+  const created = await api('POST', '/create-kr-bu', {
+    name: 'ToolBox-BU',
+    address: BOARD_IP,
+    port: BOARD_PORT,
+    stype: BOARD_TYPE,
+    descr: 'ToolBox smart box',
+    enabled: true,
+  });
+  cachedBuUuid = created.uuid;
+  return cachedBuUuid;
 }
 
 // ==========================================
@@ -85,83 +69,63 @@ async function kerongRequest(method, path, body = null) {
 // ==========================================
 
 /**
- * Открыть замок
- * POST /api/v1/zones/open-lock
- * @param {number} zoneId - ID зоны в Kerong
- * @param {number} lockNumber - Номер замка (1-16)
+ * Открыть замок.
+ * @param {number} zoneId    - зона бокса (kerong_zone_id); при одной плате не используется
+ * @param {number} lockNumber - номер замка на плате (0-based позиция)
  */
 async function openLock(zoneId, lockNumber) {
-  console.log(`[KERONG] Открываем замок #${lockNumber} в зоне ${zoneId}`);
-  
+  console.log(`[KERONG] Открываем замок #${lockNumber} (зона ${zoneId})`);
+
   if (MOCK_MODE) {
     console.log(`[KERONG MOCK] Замок #${lockNumber} открыт (мок)`);
     return { success: true, mock: true };
   }
 
-  await kerongRequest('POST', '/zones/open-lock', { lockNumber, zoneId });
-  console.log(`[KERONG] Замок #${lockNumber} открыт!`);
+  const buBoardUuid = await resolveBoardUuid();
+  // ГОТЧА: поле uuid называется именно buBoardUuid; поле замка — lockNumber
+  const r = await api('POST', '/open-lock', {
+    buBoardUuid,
+    krCuId: 0,
+    lockNumber,
+  });
+  if (r && r.ok === false) throw new Error(`Kerong open-lock отказ: ${JSON.stringify(r)}`);
+  console.log(`[KERONG] Замок #${lockNumber} открыт!`, r);
   return { success: true };
 }
 
 /**
- * Получить свободные ячейки в зоне
- * GET /api/v1/zones/{id}/free-locks-numbers
- * @param {number} zoneId
- * @returns {number[]} массив свободных номеров замков
+ * Получить состояние замков (свободные = замок закрыт/ячейка пуста).
+ * Возвращает массив номеров, для совместимости со старой сигнатурой.
  */
 async function getFreeLocks(zoneId) {
-  if (MOCK_MODE) {
-    return [1, 2, 3, 4, 5, 6]; // мок: все 6 свободны
-  }
-  
-  const data = await kerongRequest('GET', `/zones/${zoneId}/free-locks-numbers`);
-  return data.freeLocksNumbers || [];
+  if (MOCK_MODE) return [0, 1, 2, 3, 4, 5];
+
+  const buBoardUuid = await resolveBoardUuid();
+  const matrix = await api('GET', `/locks-list?kr-bu-uuid=${encodeURIComponent(buBoardUuid)}`);
+  const cu = Array.isArray(matrix) ? matrix[0] : null;
+  if (!cu || !Array.isArray(cu.locks)) return [];
+  // detectionStatus === 'EMPTY' → ячейка свободна
+  return cu.locks.filter(l => l.detectionStatus === 'EMPTY').map(l => l.lockNumber ?? l.lockId);
 }
 
 /**
- * Создать аренду в Kerong LCS
- * PATCH /api/v1/booking
- */
-async function createBooking({ lockNumber, zoneId, startDate, endDate }) {
-  if (MOCK_MODE) {
-    return { uuid: `mock-${Date.now()}`, lockNumber, zoneId, active: true, mock: true };
-  }
-
-  return kerongRequest('PATCH', '/booking', {
-    lockNumber,
-    zoneId,
-    startDate,
-    endDate,
-    identifiersIdList: [],
-    accessMode: 'PUBLIC',
-    isPasswordAccess: false
-  });
-}
-
-/**
- * Завершить аренду в Kerong LCS (active=false, конец аренды = сейчас)
- * PATCH /api/v1/booking/active/{uuid} (раздел 6.12 документации LCS)
- */
-async function completeBooking(bookingUuid) {
-  if (MOCK_MODE) {
-    console.log(`[KERONG MOCK] Аренда ${bookingUuid} завершена (мок)`);
-    return { success: true, mock: true };
-  }
-
-  return kerongRequest('PATCH', `/booking/active/${bookingUuid}`);
-}
-
-/**
- * Проверить статус соединения с Kerong LCS
+ * Проверить связь с LCS и платой.
  */
 async function checkConnection() {
   if (MOCK_MODE) {
     return { connected: false, mode: 'mock', message: 'KERONG_LCS_URL не задан, работаем в режиме мока' };
   }
-
   try {
-    await getToken();
-    return { connected: true, mode: 'live', url: KERONG_URL };
+    const buBoardUuid = await resolveBoardUuid();
+    const matrix = await api('GET', `/locks-list?kr-bu-uuid=${encodeURIComponent(buBoardUuid)}`);
+    const cu = Array.isArray(matrix) ? matrix[0] : null;
+    return {
+      connected: !!cu,
+      mode: 'live',
+      url: KERONG_URL,
+      board: BOARD_IP,
+      locks: cu ? cu.locks.length : 0,
+    };
   } catch (err) {
     return { connected: false, mode: 'error', message: err.message };
   }
@@ -170,8 +134,6 @@ async function checkConnection() {
 module.exports = {
   openLock,
   getFreeLocks,
-  createBooking,
-  completeBooking,
   checkConnection,
-  MOCK_MODE
+  MOCK_MODE,
 };

@@ -54,7 +54,7 @@ async function getRental(rentalId) {
   if (!rentalId || !/^[0-9a-f-]{36}$/i.test(String(rentalId))) return null;
   const { data } = await supabase
     .from('rentals')
-    .select('*, tools(name, cell_id, cells(cell_number, boxes(*)))')
+    .select('*, tools(name, cell_id, cells(cell_number, kerong_lock_number, boxes(*)))')
     .eq('id', rentalId)
     .single();
   return data || null;
@@ -195,9 +195,10 @@ async function performTransaction(params) {
 
   // Открываем замок (ошибка замка не должна ронять подтверждение оплаты)
   try {
-    const zoneId = rental?.tools?.cells?.boxes?.kerong_zone_id || 1;
-    const lockNumber = rental?.tools?.cells?.cell_number;
-    if (lockNumber) await kerong.openLock(zoneId, lockNumber);
+    const cell = rental?.tools?.cells;
+    const zoneId = cell?.boxes?.kerong_zone_id || 1;
+    const lockNumber = cell?.kerong_lock_number ?? (cell?.cell_number != null ? cell.cell_number - 1 : null);
+    if (lockNumber != null) await kerong.openLock(zoneId, lockNumber);
   } catch (e) {
     console.error('payme perform: lock open failed', e.message);
   }
