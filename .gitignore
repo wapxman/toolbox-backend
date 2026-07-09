@@ -3,3 +3,10 @@ node_modules/
 .DS_Store
 .vercel
 .env*
+
+# аудит-артефакты
+rid_*.txt
+rent*.json
+jwt_audit.txt
+.env.audit
+.env.local
