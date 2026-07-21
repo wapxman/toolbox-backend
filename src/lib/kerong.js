@@ -25,6 +25,12 @@ const MOCK_MODE = !KERONG_URL;
 // uuid платы в LCS генерится при создании — кэшируем после первого резолва
 let cachedBuUuid = null;
 
+// Cloudflare quick-туннель иногда мигает 502/503/504 при переподключении.
+// Замок открывать критично, поэтому повторяем при таких сбоях и сетевых ошибках.
+const RETRY_STATUSES = new Set([502, 503, 504]);
+const MAX_ATTEMPTS = 4;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function api(method, path, body = null) {
   const opts = { method, headers: {} };
   if (LCS_SECRET) opts.headers['X-ToolBox-Secret'] = LCS_SECRET;
@@ -32,14 +38,37 @@ async function api(method, path, body = null) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(`${KERONG_URL}/kerong-api${path}`, opts);
-  const text = await res.text();
-  let data;
-  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
-  if (!res.ok) {
-    throw new Error(`Kerong LCS ${res.status}: ${text || res.statusText}`);
+
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`${KERONG_URL}/kerong-api${path}`, opts);
+      const text = await res.text();
+      if (!res.ok) {
+        // временный сбой туннеля/шлюза — повторяем
+        if (RETRY_STATUSES.has(res.status) && attempt < MAX_ATTEMPTS) {
+          console.warn(`[KERONG] ${res.status} на ${path}, попытка ${attempt}/${MAX_ATTEMPTS}`);
+          await sleep(400 * attempt);
+          continue;
+        }
+        throw new Error(`Kerong LCS ${res.status}: ${text || res.statusText}`);
+      }
+      let data;
+      try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      // сетевой обрыв (туннель переустанавливается) — тоже повторяем
+      const retriable = err.name === 'TypeError' || /fetch failed|network|ECONN|ETIMEDOUT/i.test(err.message);
+      if (retriable && attempt < MAX_ATTEMPTS) {
+        console.warn(`[KERONG] сетевой сбой на ${path}, попытка ${attempt}/${MAX_ATTEMPTS}: ${err.message}`);
+        await sleep(400 * attempt);
+        continue;
+      }
+      throw err;
+    }
   }
-  return data;
+  throw lastErr;
 }
 
 /**
