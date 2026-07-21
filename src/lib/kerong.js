@@ -17,6 +17,9 @@ const KERONG_URL = (process.env.KERONG_LCS_URL || '').replace(/\/+$/, '');
 const BOARD_IP = process.env.KERONG_BOARD_IP || '192.168.0.7';
 const BOARD_PORT = parseInt(process.env.KERONG_BOARD_PORT || '23', 10);
 const BOARD_TYPE = process.env.KERONG_BOARD_TYPE || 'CU_16';
+// Секрет для привратника перед LCS: сам kerong-api не имеет авторизации,
+// поэтому на точке перед ним стоит прокси, пускающий только с этим заголовком.
+const LCS_SECRET = process.env.KERONG_LCS_SECRET || '';
 const MOCK_MODE = !KERONG_URL;
 
 // uuid платы в LCS генерится при создании — кэшируем после первого резолва
@@ -24,6 +27,7 @@ let cachedBuUuid = null;
 
 async function api(method, path, body = null) {
   const opts = { method, headers: {} };
+  if (LCS_SECRET) opts.headers['X-ToolBox-Secret'] = LCS_SECRET;
   if (body) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
