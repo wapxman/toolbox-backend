@@ -69,8 +69,10 @@ async function sendSmsCode(phone, code) {
   }
 
   if (provider === 'eskiz') {
-    // Текст должен совпадать с шаблоном, одобренным в кабинете Eskiz
-    const message = `Kod dlya vhoda v mobilnoe prilozhenie ToolBox: ${code}. Nikomu ne soobshchayte.`;
+    // Текст должен ТОЧНО совпадать с одобренным шаблоном Eskiz (id 79092):
+    //   "Kod dlya vhoda v mobilnoe prilozhenie ToolBox: %w Nikomu ne soobshchayte."
+    // %w = сам код. Лишняя точка после кода ломала совпадение → Eskiz не доставлял.
+    const message = `Kod dlya vhoda v mobilnoe prilozhenie ToolBox: ${code} Nikomu ne soobshchayte.`;
     return eskizSend(phone, message);
   }
 
