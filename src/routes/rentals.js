@@ -68,11 +68,9 @@ router.post('/', async (req, res) => {
 
     if (rentalErr) throw rentalErr;
 
-    // Резервируем ячейку на время оплаты
-    await supabase
-      .from('cells')
-      .update({ status: 'occupied' })
-      .eq('id', tool.cell_id);
+    // Ячейку НЕ резервируем до оплаты: иначе брошенная (неоплаченная) аренда
+    // держала бы инструмент «Занят» навсегда. Ячейка помечается occupied только
+    // после реального подтверждения оплаты — в Payme PerformTransaction.
 
     res.json({
       rental,

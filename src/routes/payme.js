@@ -183,6 +183,13 @@ async function performTransaction(params) {
     })
     .eq('id', tx.rental_id);
 
+  // Помечаем ячейку занятой только теперь — после реальной оплаты.
+  if (rental?.tools?.cell_id) {
+    await supabase.from('cells')
+      .update({ status: 'occupied' })
+      .eq('id', rental.tools.cell_id);
+  }
+
   await supabase.from('transactions').insert({
     rental_id: tx.rental_id,
     user_id: rental?.user_id,
