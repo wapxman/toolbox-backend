@@ -35,6 +35,9 @@ app.use('/api/rentals', rentalRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/locks', lockRoutes);
 app.use('/api/payments/payme', paymeRoutes);
+// Алиас на случай, если в кабинете Payme прописан короткий путь endpoint.
+// Оба адреса ведут на один и тот же Merchant-API обработчик.
+app.use('/api/payme', paymeRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
