@@ -92,6 +92,9 @@ router.post('/', async (req, res) => {
           provider: 'click',
           click_invoice: true,
           invoice_id: inv.invoice_id,
+          // Ссылку отдаём, чтобы приложение сразу открыло Click (как Payme).
+          // Счёт с суммой уже в Click Up; ссылка нужна лишь для перехода в приложение.
+          payment_url: buildClickUrl(rental.id, totalPrice),
           message: 'Счёт отправлен в приложение Click. Откройте Click и подтвердите оплату.',
         });
       }
