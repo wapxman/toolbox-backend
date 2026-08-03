@@ -202,4 +202,29 @@ router.post('/complete', async (req, res) => {
   });
 });
 
+// --- Return URL: страница, куда Click возвращает клиента после оплаты ---
+// Приложение всё равно определяет оплату опросом /payment-status и само закрывает
+// встроенный браузер; эта страница нужна как валидная точка возврата для Click.
+router.get('/return', (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Taketool — оплата</title>
+<style>
+  body{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#fff;
+       display:flex;min-height:100vh;align-items:center;justify-content:center;color:#1a1a1a}
+  .c{text-align:center;padding:28px;max-width:340px}
+  .ok{width:72px;height:72px;border-radius:50%;background:#E02020;margin:0 auto 20px;
+      display:flex;align-items:center;justify-content:center}
+  .ok svg{width:38px;height:38px}
+  h1{font-size:20px;margin:0 0 8px} p{color:#666;font-size:14px;line-height:1.5;margin:0}
+</style></head>
+<body><div class="c">
+  <div class="ok"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"
+       stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></div>
+  <h1>Оплата обработана</h1>
+  <p>Вернитесь в приложение <b>Taketool</b> — статус аренды обновится автоматически.</p>
+</div></body></html>`);
+});
+
 module.exports = router;
