@@ -1,6 +1,7 @@
 const express = require('express');
 const supabase = require('../lib/supabase');
 const kerong = require('../lib/kerong');
+const clickMapi = require('../lib/click_mapi');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -72,15 +73,47 @@ router.post('/', async (req, res) => {
     // держала бы инструмент «Занят» навсегда. Ячейка помечается occupied только
     // после реального подтверждения оплаты — в Payme PerformTransaction.
 
-    const useClick = provider === 'click';
+    if (provider === 'click') {
+      // Метод 3 (Create Invoice): счёт с суммой прилетает пушем в приложение
+      // Click Up на номер пользователя (как Payme). Подтверждение оплаты придёт
+      // к нам через SHOP API Prepare/Complete. Телефон берём из профиля (вариант Б).
+      const { data: usr } = await supabase
+        .from('users').select('phone').eq('id', req.userId).single();
+      const inv = await clickMapi.createInvoice({
+        phone: usr?.phone,
+        amount: totalPrice,
+        merchantTransId: rental.id,
+      });
+      if (inv && Number(inv.error_code) === 0 && inv.invoice_id) {
+        return res.json({
+          rental,
+          tool_name: tool.name,
+          total_price: totalPrice,
+          provider: 'click',
+          click_invoice: true,
+          invoice_id: inv.invoice_id,
+          message: 'Счёт отправлен в приложение Click. Откройте Click и подтвердите оплату.',
+        });
+      }
+      // Фолбэк: инвойс не создался (напр. номер не в Click) — отдаём платёжную ссылку.
+      console.error('click invoice failed:', inv);
+      return res.json({
+        rental,
+        tool_name: tool.name,
+        total_price: totalPrice,
+        provider: 'click',
+        click_invoice: false,
+        payment_url: buildClickUrl(rental.id, totalPrice),
+        message: 'Счёт не удалось отправить в Click — откроем страницу оплаты.',
+      });
+    }
+
     res.json({
       rental,
       tool_name: tool.name,
       total_price: totalPrice,
-      provider: useClick ? 'click' : 'payme',
-      payment_url: useClick
-        ? buildClickUrl(rental.id, totalPrice)
-        : buildPaymeUrl(rental.id, totalPrice),
+      provider: 'payme',
+      payment_url: buildPaymeUrl(rental.id, totalPrice),
       message: 'Аренда создана. Оплатите, чтобы открыть замок.'
     });
   } catch (err) {
