@@ -10,3 +10,7 @@ rent*.json
 jwt_audit.txt
 .env.audit
 .env.local
+
+# тест-скрипты с секретами (только локально)
+test_full_cycle.js
+run_tester.cmd

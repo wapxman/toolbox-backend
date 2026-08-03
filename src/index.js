@@ -9,6 +9,7 @@ const rentalRoutes = require('./routes/rentals');
 const notificationRoutes = require('./routes/notifications');
 const lockRoutes = require('./routes/locks');
 const paymeRoutes = require('./routes/payme');
+const clickRoutes = require('./routes/click');
 const kerong = require('./lib/kerong');
 
 const app = express();
@@ -21,7 +22,7 @@ app.use(express.json());
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
-    name: 'ToolBox API',
+    name: 'Taketool API',
     version: '1.1.0',
     kerong: kerong.MOCK_MODE ? 'mock' : 'live'
   });
@@ -38,6 +39,9 @@ app.use('/api/payments/payme', paymeRoutes);
 // Алиас на случай, если в кабинете Payme прописан короткий путь endpoint.
 // Оба адреса ведут на один и тот же Merchant-API обработчик.
 app.use('/api/payme', paymeRoutes);
+// Click SHOP API: /api/payments/click/prepare и /complete — эти URL прописываем
+// в кабинете merchant.click.uz (Сервисы → адреса проверки и результата).
+app.use('/api/payments/click', clickRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
@@ -52,7 +56,7 @@ module.exports = app;
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
-    console.log(`\n  ToolBox API запущен: http://localhost:${PORT}`);
+    console.log(`\n  Taketool API запущен: http://localhost:${PORT}`);
     console.log(`  Kerong: ${kerong.MOCK_MODE ? 'MOCK режим' : 'LIVE'}\n`);
   });
 }

@@ -15,7 +15,7 @@ function calculatePrice(dayPrice, days) {
 // POST /api/rentals — создать аренду + открыть замок
 router.post('/', async (req, res) => {
   try {
-    const { tool_id, days } = req.body;
+    const { tool_id, days, provider } = req.body;
 
     if (!tool_id || !days || days < 1 || days > 30) {
       return res.status(400).json({ error: 'Укажите инструмент и количество дней (1-30)' });
@@ -72,11 +72,15 @@ router.post('/', async (req, res) => {
     // держала бы инструмент «Занят» навсегда. Ячейка помечается occupied только
     // после реального подтверждения оплаты — в Payme PerformTransaction.
 
+    const useClick = provider === 'click';
     res.json({
       rental,
       tool_name: tool.name,
       total_price: totalPrice,
-      payment_url: buildPaymeUrl(rental.id, totalPrice),
+      provider: useClick ? 'click' : 'payme',
+      payment_url: useClick
+        ? buildClickUrl(rental.id, totalPrice)
+        : buildPaymeUrl(rental.id, totalPrice),
       message: 'Аренда создана. Оплатите, чтобы открыть замок.'
     });
   } catch (err) {
@@ -92,6 +96,22 @@ function buildPaymeUrl(rentalId, priceSum) {
   const base = process.env.PAYME_CHECKOUT_URL || 'https://checkout.paycom.uz';
   const payload = `m=${merchantId};ac.rental_id=${rentalId};a=${priceSum * 100}`;
   return `${base}/${Buffer.from(payload).toString('base64')}`;
+}
+
+// Ссылка на оплату Click: my.click.uz/services/pay (сумма в СУМАХ, transaction_param = rental_id).
+// merchant_trans_id, который Click вернёт в Prepare/Complete — это наш rental_id.
+function buildClickUrl(rentalId, priceSum) {
+  const serviceId = process.env.CLICK_SERVICE_ID;
+  const merchantId = process.env.CLICK_MERCHANT_ID;
+  if (!serviceId || !merchantId) return null;
+  const params = new URLSearchParams({
+    service_id: serviceId,
+    merchant_id: merchantId,
+    amount: String(priceSum),
+    transaction_param: rentalId,
+  });
+  if (process.env.CLICK_RETURN_URL) params.set('return_url', process.env.CLICK_RETURN_URL);
+  return `https://my.click.uz/services/pay?${params.toString()}`;
 }
 
 // GET /api/rentals/:id/payment-status — поллинг оплаты из приложения
@@ -307,7 +327,7 @@ router.post('/:id/return', async (req, res) => {
       title: overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
       message: overdueFee > 0
         ? `${rental.tools.name} — штраф ${overdueFee.toLocaleString('ru-RU')} сум`
-        : `${rental.tools.name} — спасибо за использование ToolBox!`
+        : `${rental.tools.name} — спасибо за использование Taketool!`
     });
 
     res.json({

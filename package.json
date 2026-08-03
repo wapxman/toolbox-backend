@@ -1,7 +1,7 @@
 {
   "name": "toolbox-backend",
   "version": "1.0.0",
-  "description": "ToolBox — Backend API for smart tool rental boxes",
+  "description": "Taketool — Backend API for smart tool rental boxes",
   "main": "src/index.js",
   "scripts": {
     "dev": "node --watch src/index.js",
