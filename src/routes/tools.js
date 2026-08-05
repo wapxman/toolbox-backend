@@ -13,6 +13,13 @@ router.get('/search', async (req, res) => {
       return res.status(400).json({ error: 'Минимум 2 символа для поиска' });
     }
 
+    // Запятые/скобки — синтаксис PostgREST-фильтра .or(): вырезаем их,
+    // чтобы пользовательский ввод не мог переписать условия запроса.
+    const safeQ = q.replace(/[,()]/g, ' ').trim();
+    if (safeQ.length < 2) {
+      return res.status(400).json({ error: 'Минимум 2 символа для поиска' });
+    }
+
     const { data: tools, error } = await supabase
       .from('tools')
       .select(`
@@ -29,7 +36,7 @@ router.get('/search', async (req, res) => {
           )
         )
       `)
-      .or(`name.ilike.%${q}%,category.ilike.%${q}%,brand.ilike.%${q}%`);
+      .or(`name.ilike.%${safeQ}%,category.ilike.%${safeQ}%,brand.ilike.%${safeQ}%`);
 
     if (error) throw error;
 

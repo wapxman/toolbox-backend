@@ -62,7 +62,8 @@ router.post('/', async (req, res) => {
         started_at: startedAt.toISOString(),
         expected_end: expectedEnd.toISOString(),
         status: 'pending_payment',
-        total_price: totalPrice
+        total_price: totalPrice,
+        payment_provider: provider === 'click' ? 'click' : 'payme'
       })
       .select()
       .single();
@@ -155,7 +156,7 @@ router.get('/:id/payment-status', async (req, res) => {
   try {
     const { data: rental, error } = await supabase
       .from('rentals')
-      .select('id, status, total_price')
+      .select('id, status, total_price, payment_provider')
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
@@ -167,9 +168,12 @@ router.get('/:id/payment-status', async (req, res) => {
     res.json({
       rental_id: rental.id,
       status: rental.status,
+      provider: rental.payment_provider || 'payme',
       paid: rental.status === 'active',
       payment_url: rental.status === 'pending_payment'
-        ? buildPaymeUrl(rental.id, rental.total_price)
+        ? (rental.payment_provider === 'click'
+            ? buildClickUrl(rental.id, rental.total_price)
+            : buildPaymeUrl(rental.id, rental.total_price))
         : null
     });
   } catch (err) {
@@ -270,6 +274,11 @@ router.post('/:id/extend', async (req, res) => {
     if (rental.status === 'completed') {
       return res.status(400).json({ error: 'Аренда уже завершена' });
     }
+    // Продлевать можно только оплаченную аренду — иначе pending_payment/cancelled
+    // «оживали» бы в active без оплаты.
+    if (!['active', 'overdue'].includes(rental.status)) {
+      return res.status(400).json({ error: 'Аренда не активна — продление невозможно' });
+    }
 
     const newDays = rental.days + extra_days;
     const extraPrice = calculatePrice(rental.tools.day_price, extra_days);
@@ -321,6 +330,11 @@ router.post('/:id/return', async (req, res) => {
 
     if (rental.status === 'completed') {
       return res.status(400).json({ error: 'Уже возвращён' });
+    }
+    // Замок открывается только по оплаченной (активной/просроченной) аренде —
+    // pending_payment/cancelled сюда не проходят, иначе инструмент выдаётся бесплатно.
+    if (!['active', 'overdue'].includes(rental.status)) {
+      return res.status(400).json({ error: 'Аренда не активна — возврат невозможен' });
     }
 
     // Открываем замок для возврата через Kerong

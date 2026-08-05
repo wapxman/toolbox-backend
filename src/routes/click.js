@@ -69,14 +69,33 @@ router.post('/prepare', async (req, res) => {
   if (!rental) {
     return res.json({ ...base, error: E.NOT_FOUND, error_note: 'Order not found' });
   }
-  if (rental.status === 'active') {
-    return res.json({ ...base, error: E.ALREADY_PAID, error_note: 'Already paid' });
-  }
   if (rental.status === 'cancelled') {
     return res.json({ ...base, error: E.CANCELLED, error_note: 'Order cancelled' });
   }
+  // К оплате допускается ТОЛЬКО pending_payment: active/completed/overdue —
+  // уже оплаченные жизненные стадии, повторная оплата по ним запрещена.
+  if (rental.status !== 'pending_payment') {
+    return res.json({ ...base, error: E.ALREADY_PAID, error_note: 'Already paid' });
+  }
   if (Math.round(Number(p.amount)) !== Math.round(Number(rental.total_price))) {
     return res.json({ ...base, error: E.AMOUNT, error_note: 'Incorrect amount' });
+  }
+
+  // Идемпотентность: повторный Prepare с тем же click_trans_id возвращает
+  // ту же строку, а не создаёт дубль (на click_trans_id уникальный индекс).
+  const { data: existing } = await supabase.from('click_transactions')
+    .select('*').eq('click_trans_id', String(p.click_trans_id)).maybeSingle();
+  if (existing) {
+    if (existing.state === ST_CANCELLED) {
+      return res.json({ ...base, error: E.CANCELLED, error_note: 'Transaction cancelled' });
+    }
+    return res.json({
+      click_trans_id: p.click_trans_id,
+      merchant_trans_id: p.merchant_trans_id,
+      merchant_prepare_id: existing.prepare_id,
+      error: E.OK,
+      error_note: 'Success',
+    });
   }
 
   const { data: tx, error } = await supabase.from('click_transactions').insert({
@@ -93,10 +112,12 @@ router.post('/prepare', async (req, res) => {
     return res.json({ ...base, error: E.UPDATE_FAIL, error_note: 'Failed to create transaction' });
   }
 
+  // merchant_prepare_id — ЧИСЛО (bigint identity), Click ждёт именно integer,
+  // uuid строки он может не принять / порезать.
   return res.json({
     click_trans_id: p.click_trans_id,
     merchant_trans_id: p.merchant_trans_id,
-    merchant_prepare_id: tx.id,
+    merchant_prepare_id: tx.prepare_id,
     error: E.OK,
     error_note: 'Success',
   });
@@ -118,10 +139,15 @@ router.post('/complete', async (req, res) => {
     return res.json({ ...base, error: E.SIGN, error_note: 'SIGN CHECK FAILED' });
   }
 
+  // Ищем по числовому prepare_id (его мы вернули в Prepare)
   const { data: tx } = await supabase.from('click_transactions')
-    .select('*').eq('id', p.merchant_prepare_id).single();
+    .select('*').eq('prepare_id', Number(p.merchant_prepare_id) || -1).maybeSingle();
   if (!tx) {
     return res.json({ ...base, error: E.TX_NOT_FOUND, error_note: 'Transaction not found' });
+  }
+  // Сверяем, что Complete пришёл по той же аренде, что и Prepare
+  if (String(tx.merchant_trans_id) !== String(p.merchant_trans_id)) {
+    return res.json({ ...base, error: E.BAD_PARAMS, error_note: 'merchant_trans_id mismatch' });
   }
   if (tx.state === ST_CANCELLED) {
     return res.json({ ...base, error: E.CANCELLED, error_note: 'Transaction cancelled' });
@@ -132,7 +158,7 @@ router.post('/complete', async (req, res) => {
     await supabase.from('click_transactions')
       .update({ state: ST_CANCELLED, cancel_time: Date.now() }).eq('id', tx.id);
     await supabase.from('rentals').update({ status: 'cancelled' }).eq('id', tx.merchant_trans_id);
-    return res.json({ ...base, merchant_confirm_id: tx.id, error: Number(p.error), error_note: 'Cancelled by Click' });
+    return res.json({ ...base, merchant_confirm_id: tx.prepare_id, error: Number(p.error), error_note: 'Cancelled by Click' });
   }
   if (Math.round(Number(p.amount)) !== Math.round(Number(tx.amount))) {
     return res.json({ ...base, error: E.AMOUNT, error_note: 'Incorrect amount' });
@@ -140,7 +166,7 @@ router.post('/complete', async (req, res) => {
   if (tx.state === ST_CONFIRMED) {
     return res.json({
       click_trans_id: p.click_trans_id, merchant_trans_id: p.merchant_trans_id,
-      merchant_confirm_id: tx.id, error: E.OK, error_note: 'Already confirmed',
+      merchant_confirm_id: tx.prepare_id, error: E.OK, error_note: 'Already confirmed',
     });
   }
 
@@ -196,7 +222,7 @@ router.post('/complete', async (req, res) => {
   return res.json({
     click_trans_id: p.click_trans_id,
     merchant_trans_id: p.merchant_trans_id,
-    merchant_confirm_id: tx.id,
+    merchant_confirm_id: tx.prepare_id,
     error: E.OK,
     error_note: 'Success',
   });

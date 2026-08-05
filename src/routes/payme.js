@@ -238,11 +238,14 @@ async function cancelTransaction(params) {
     .update({ state: newState, reason: Number(params.reason) || null, cancel_time: cancelTime })
     .eq('id', tx.id);
 
-  // Возвращаем аренду/ячейку
+  // Возвращаем аренду/ячейку. Завершённую аренду (инструмент уже возвращён)
+  // не трогаем — отмена транзакции не должна переписывать её историю.
   const rental = await getRental(tx.rental_id);
-  await supabase.from('rentals').update({ status: 'cancelled' }).eq('id', tx.rental_id);
-  if (rental?.tools?.cells) {
-    await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+  if (rental && rental.status !== 'completed') {
+    await supabase.from('rentals').update({ status: 'cancelled' }).eq('id', tx.rental_id);
+    if (rental?.tools?.cells) {
+      await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+    }
   }
   if (newState === STATE_CANCELLED_AFTER) {
     await supabase.from('transactions')
