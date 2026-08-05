@@ -1,7 +1,9 @@
-# ToolBox (TOOLS24) — Полный гид проекта
+# Taketool (ex-ToolBox/TOOLS24) — Полный гид проекта
 
-> Единый актуальный справочник. Обновлён: **3 июля 2026**.
+> Единый актуальный справочник. Обновлён: **5 августа 2026**.
 > Заменяет устаревшие BRIEF.md и PLAN.md (они от апреля 2026).
+> Бренд: **Taketool** (ребрендинг 03.08.2026). В SMS пока «ToolBox» — текст
+> жёстко привязан к одобренному шаблону Eskiz, менять только с новой модерацией.
 
 ---
 
@@ -13,8 +15,9 @@
 **Сценарий:** открыл приложение → нашёл ближайший бокс на карте → выбрал инструмент →
 оплатил → замок открылся → забрал → вернул когда готов.
 
-**Бизнес-модель:** посуточная аренда. Скидки: −20% от 3 дней, −35% от 7+ дней.
-Оплата Payme (Click — следующий). Пилот: 2 точки в Ташкенте.
+**Бизнес-модель:** посуточная аренда. Скидки: −20% от 3 дней, −35% от 7+ дней
+(с 05.08.2026 редактируются в админке, Настройки → app_settings key='pricing').
+Оплата Payme ✅ и Click ✅. Пилот: 2 точки в Ташкенте.
 
 **Юрлицо:** «AB PARTNERS» MChJ (директор NOSIROV BEHRUZ). Аккаунт GitHub/сервисов: **wapxman**.
 
@@ -41,13 +44,15 @@
 |---|---|---|
 | `users` | пользователи | phone, name, is_blocked, terms_accepted_at |
 | `boxes` | боксы | name, address, lat, lng, cells_count, status, **kerong_zone_id** |
-| `cells` | ячейки | box_id, cell_number, status(free/occupied), qr_code |
+| `cells` | ячейки | box_id, cell_number, status(free/occupied), qr_code, **kerong_lock_number** |
 | `tools` | инструменты | cell_id, name, category, brand, day_price, specs(jsonb), photo_url |
-| `rentals` | аренды | user_id, tool_id, days, status, total_price, overdue_fee |
-| `transactions` | платежи | rental_id, amount, payment_method, payment_id, status |
+| `rentals` | аренды | user_id, tool_id, days, status, total_price, overdue_fee, **payment_provider** (payme/click) |
+| `transactions` | платежи (общий журнал) | rental_id, amount, payment_method(payme/click), payment_id, status |
 | `notifications` | уведомления | user_id, type, title, message, read |
 | `sms_codes` | коды из SMS | phone(pk), code, expires_at |
 | `payme_transactions` | транзакции Payme | paycom_id, rental_id, amount(тийины), state |
+| `click_transactions` | транзакции Click | click_trans_id (unique), **prepare_id** (bigint — его отдаём Click как merchant_prepare_id), merchant_trans_id→rentals, amount(сумы), state(1/2/−1) |
+| `app_settings` | настройки из админки | key(pk), value(jsonb); key='pricing': discount3_pct, discount7_pct, overdue_multiplier |
 
 **Статусы `rentals.status`:** `pending_payment` → `active` → `completed` / `overdue` / `cancelled`.
 
@@ -68,9 +73,15 @@
 | `JWT_SECRET` | подпись токенов авторизации (30 дней) |
 | `SMS_PROVIDER` | `eskiz` (боевой) или `console` (dev, мастер-код 0000) |
 | `ESKIZ_EMAIL`, `ESKIZ_PASSWORD` | доступ к SMS-шлюзу Eskiz |
-| `PAYME_MERCHANT_ID`, `PAYME_KEY` | касса Payme (ключ пока тестовый) |
-| `PAYME_CHECKOUT_URL` | `https://checkout.test.paycom.uz` (тест). Убрать для боевого |
-| `KERONG_LCS_URL`, `KERONG_LCS_USER`, `KERONG_LCS_PASSWORD` | замки (пока не заданы → mock) |
+| `PAYME_MERCHANT_ID`, `PAYME_KEY` | касса Payme (БОЕВОЙ ключ на production) |
+| `PAYME_CHECKOUT_URL` | не задан на production → боевой checkout.paycom.uz |
+| `CLICK_SERVICE_ID`, `CLICK_MERCHANT_ID`, `CLICK_SECRET_KEY` | Click SHOP API (подпись колбэков Prepare/Complete) |
+| `CLICK_MERCHANT_USER_ID` | Click Merchant API (Create Invoice — счёт пушем в Click Up) |
+| `CLICK_RETURN_URL` | страница возврата после оплаты Click |
+| `KERONG_LCS_URL` | туннель к LCS мини-ПК (не задан → mock-режим замков) |
+| `KERONG_LCS_SECRET` | заголовок X-ToolBox-Secret для привратника lcs-guard на мини-ПК |
+| `KERONG_BOARD_IP/PORT/TYPE` | адрес платы KR-BU (дефолты 192.168.0.7 / 23 / CU_16) |
+| `ADMIN_API_SECRET` | заголовок X-Admin-Secret для сервисных роутов /api/locks/* (без него роуты выключены) |
 
 ---
 
@@ -81,16 +92,20 @@
 - `minSdk 26` обязателен (требование MapKit).
 - Экран `map_screen.dart`: карта Ташкента, зелёные пины боксов, тап → бокс.
 
-### 5.2 SMS-вход (Eskiz.uz) ✅ код готов, ⏳ ждём модерацию
-- Договор с Eskiz №1291-2026. Баланс 305 000 сум. Кабинет: my.eskiz.uz.
+### 5.2 SMS-вход (Eskiz.uz) ✅ РАБОТАЕТ (шаблон одобрен, SMS ходят)
+- Договор с Eskiz №1291-2026. Кабинет: my.eskiz.uz.
 - `lib/sms.js`: логин в шлюз, кэш токена, релогин при 401.
 - Коды хранятся в таблице `sms_codes` (не в памяти — Vercel serverless теряет память).
-- Шаблон: `ToolBox: kod podtverzhdeniya {code}. Nikomu ne soobshchayte.` (id 78996).
-- **Статус:** шаблон на модерации, аккаунт `inactive`. Проверка:
-  `GET https://notify.eskiz.uz/api/user/templates` (Bearer-токен из логина).
-- Как одобрят: SMS пойдут сами, мастер-код 0000 отключится автоматически.
+- ⚠️ Текст SMS жёстко совпадает с одобренным шаблоном (см. комментарий в sms.js):
+  `Kod dlya vhoda v mobilnoe prilozhenie ToolBox: {code} Nikomu ne soobshchayte.`
+  Менять текст (в т.ч. ребрендить «ToolBox»→«Taketool») можно ТОЛЬКО после
+  одобрения нового шаблона в Eskiz — иначе SMS перестанут доставляться.
 
-### 5.3 Оплата (Payme) ✅ БОЕВОЙ РЕЖИМ с 06.07.2026, ⏳ активация кассы в кабинете
+### 5.3 Оплата (Payme) ✅✅ БОЕВОЙ РЕЖИМ, первый реальный платёж 08.07.2026
+- Касса «TOOLS24» активна, вся цепочка оплата → активация аренды → открытие
+  реального замка доказана живьём (10.07.2026).
+
+<details><summary>История подключения (июль 2026)</summary>
 - 06.07.2026 Payme подтвердил тестирование. Продакшн-ключ установлен в Vercel
   (`PAYME_KEY` production), `PAYME_CHECKOUT_URL` удалён с production → боевой
   checkout.paycom.uz. Тестовая связка осталась на preview-окружении.
@@ -107,13 +122,43 @@
   `PerformTransaction` открывает замок и активирует аренду.
 - Приложение: `payment_screen.dart` открывает checkout-ссылку, поллит `/rentals/:id/payment-status`.
 - Прогнано на проде: 12 сценариев (auth, суммы, идемпотентность, отмена-возврат).
+</details>
+
+### 5.3b Оплата (Click) ✅ код готов (03–04.08.2026), ⏳ прогнать боевой колбэк
+- Два слоя (`routes/click.js`, `lib/click_mapi.js`):
+  1. **SHOP API колбэки** `/api/payments/click/prepare` и `/complete` (md5-подпись,
+     суммы в СУМАХ). Complete активирует аренду, занимает ячейку, пишет в
+     `transactions`, открывает замок — зеркало Payme PerformTransaction.
+  2. **Merchant API Create Invoice** — при `provider: 'click'` в POST /api/rentals
+     счёт пушится в приложение Click Up на телефон из профиля; фолбэк — платёжная
+     ссылка my.click.uz/services/pay.
+- `merchant_prepare_id` — ЧИСЛО (`click_transactions.prepare_id`, bigint identity),
+  Click не принимает uuid. Prepare идемпотентен (unique click_trans_id), допускается
+  только для аренды в `pending_payment`; Complete сверяет merchant_trans_id.
+- Приложение шлёт `provider` в POST /api/rentals; `/rentals/:id/payment-status`
+  отдаёт payment_url своего провайдера (rentals.payment_provider).
+- URL колбэков прописываются в кабинете merchant.click.uz (Сервисы → Prepare/Complete).
 
 ### 5.4 QR-сканер ✅ готов (тест на телефоне)
 - `qr_scanner_screen.dart` на `mobile_scanner`: камера, распознавание, фонарик.
 - Из QR извлекается UUID бокса → `getBox` → экран бокса.
 - Разрешение `CAMERA` в манифесте. В эмуляторе не тестируется (виртуальная камера).
 
-### 5.5 Замки (Kerong LCS) 🔩 железо приехало 05.07, кабели будут в пятницу 10.07
+### 5.5 Замки (Kerong LCS) ✅✅ ЖИВЫЕ — точка автономна с 22.07.2026
+- LCS (docker kerong-api v2.4.5) крутится на мини-ПК точки (WSL2+docker), перед ним
+  привратник lcs-guard (:9992, заголовок X-ToolBox-Secret), наружу — cloudflared
+  quick-туннель (URL в `C:\ToolBox\tunnel.log` мини-ПК; при смене — обновить
+  `KERONG_LCS_URL` в Vercel). Прод открывает замок №15 через эту цепочку.
+- `lib/kerong.js` работает с docker-API `/kerong-api/*` (НЕ PDF-эндпоинты `/api/v1/*`!):
+  резолв платы по IP, открытие `POST /open-lock` с полем **`buBoardUuid`** (готча),
+  ретраи 4× при 502/503/504. Маппинг: `cells.kerong_lock_number` (0-based),
+  зона — `boxes.kerong_zone_id`.
+- ⚠️ `tool/test_kerong_live.js` написан под старый PDF-API и НЕ соответствует
+  боевому клиенту. Сервисное открытие: `POST /api/locks/open` с заголовком
+  `X-Admin-Secret: $ADMIN_API_SECRET` и телом `{zoneId, lockNumber}`.
+- Детали мини-ПК (SSH, автозапуск, туннель) — в памяти Claude / у пользователя.
+
+<details><summary>История сборки стенда (июль 2026, устарело)</summary>
 **Оборудование на руках:** KR-BU «Ethe» (Ethernet-версия), KR-CU 16, 6 замков KR-S99N
 (24В/1,2А, разъём Micro-Fit 43025 — вариант подключения S99NS, раздел 2.7 руководства),
 БП S-120-24 (24В 5А, ⚠️ проверить переключатель 110/220В!), LED-БП 24В/12,5А (запас),
@@ -158,6 +203,7 @@
 - Мини-ПК для точки: б/у x86 (Beelink GK55 и т.п.), НЕ Raspberry (образ x86). Плюс роутер
   (или 4G-роутер, если на точке нет проводного интернета) и ИБП (рекомендация поставщика).
 - Документация Kerong (PDF): на рабочем столе — API LCS, установка, монтаж, моб. приложение.
+</details>
 
 ---
 
@@ -185,17 +231,18 @@ adb install -r ToolBox.apk
 
 ## 7. Что осталось сделать
 
-**Ждём внешнее:**
-- [ ] Модерация SMS-шаблона Eskiz (мониторится автоматически)
-- [ ] Активация кассы Payme → продакшн-ключ
-- [ ] Железо Kerong (приезд) → запуск LCS + Cloudflare Tunnel
+**Сделано:** SMS Eskiz ✅, Payme боевой ✅, Kerong live ✅, RLS ✅, Click (код) ✅,
+админ-настройки цен ✅, security-фиксы замков и Click ✅ (05.08.2026).
 
-**Можем делать сейчас:**
-- [ ] **Включить RLS в Supabase** (безопасность) — перевести бэкенд на service-role ключ
-- [ ] Click как второй способ оплаты
-- [ ] Финальный ребрендинг ToolBox → TOOLS24 (имя приложения, иконка, тексты, SMS-шаблон)
+**Ближайшее:**
+- [ ] Прогнать боевой колбэк Click (реальная оплата) — код готов, живьём не проверен
+- [ ] Стабильный туннель к LCS вместо quick (домен/named tunnel или Tailscale Funnel)
+- [ ] Ротировать `JWT_SECRET` (в истории git остался живой JWT из jwt_audit.txt;
+      файл из репо удалён 05.08, но история помнит; ротация разлогинит всех)
+- [ ] Финальный ребрендинг: SMS-шаблон «Taketool» через новую модерацию Eskiz
 - [ ] Восстановить из старой APK v6.9: Firebase-пуши, геолокацию «боксы рядом»
 - [ ] Уведомления: окончание аренды, просрочка
+- [ ] BIOS-автовключение мини-ПК + ИБП на точку, монтаж замков в дверцы
 
 **iOS-версия (у пользователя есть Mac — собираем на нём через Xcode):**
 - [ ] `flutter create --platforms=ios .` — сгенерировать папку `ios/`

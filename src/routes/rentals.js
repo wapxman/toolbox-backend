@@ -7,9 +7,25 @@ const auth = require('../middleware/auth');
 const router = express.Router();
 router.use(auth);
 
-function calculatePrice(dayPrice, days) {
-  if (days >= 7) return Math.round(days * dayPrice * 0.65);
-  if (days >= 3) return Math.round(days * dayPrice * 0.80);
+// Ценовые правила редактируются в админке (app_settings, key='pricing');
+// при недоступности таблицы работаем на прежних дефолтах. Кэш 60 сек.
+const DEFAULT_PRICING = { discount3_pct: 20, discount7_pct: 35, overdue_multiplier: 1.5 };
+let pricingCache = { value: DEFAULT_PRICING, ts: 0 };
+async function getPricing() {
+  if (Date.now() - pricingCache.ts < 60_000) return pricingCache.value;
+  try {
+    const { data } = await supabase
+      .from('app_settings').select('value').eq('key', 'pricing').maybeSingle();
+    pricingCache = { value: { ...DEFAULT_PRICING, ...(data?.value || {}) }, ts: Date.now() };
+  } catch {
+    pricingCache.ts = Date.now();
+  }
+  return pricingCache.value;
+}
+
+function calculatePrice(dayPrice, days, pricing = DEFAULT_PRICING) {
+  if (days >= 7) return Math.round(days * dayPrice * (1 - pricing.discount7_pct / 100));
+  if (days >= 3) return Math.round(days * dayPrice * (1 - pricing.discount3_pct / 100));
   return days * dayPrice;
 }
 
@@ -46,7 +62,7 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Инструмент уже занят' });
     }
 
-    const totalPrice = calculatePrice(tool.day_price, days);
+    const totalPrice = calculatePrice(tool.day_price, days, await getPricing());
     const startedAt = new Date();
     const expectedEnd = new Date(startedAt);
     expectedEnd.setDate(expectedEnd.getDate() + days);
@@ -281,7 +297,7 @@ router.post('/:id/extend', async (req, res) => {
     }
 
     const newDays = rental.days + extra_days;
-    const extraPrice = calculatePrice(rental.tools.day_price, extra_days);
+    const extraPrice = calculatePrice(rental.tools.day_price, extra_days, await getPricing());
     const newEnd = new Date(rental.expected_end);
     newEnd.setDate(newEnd.getDate() + extra_days);
 
@@ -348,8 +364,9 @@ router.post('/:id/return', async (req, res) => {
     let overdueFee = 0;
 
     if (now > expectedEnd) {
+      const { overdue_multiplier } = await getPricing();
       const overdueDays = Math.ceil((now - expectedEnd) / (1000 * 60 * 60 * 24));
-      overdueFee = Math.round(overdueDays * (rental.total_price / rental.days) * 1.5);
+      overdueFee = Math.round(overdueDays * (rental.total_price / rental.days) * overdue_multiplier);
     }
 
     const { data: updated, error: uErr } = await supabase

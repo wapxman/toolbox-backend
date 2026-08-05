@@ -1,21 +1,24 @@
-# ToolBox Backend API
+# Taketool Backend API
 
-Backend для приложения аренды электроинструментов через умные боксы с замками Kerong.
+Backend для приложения аренды электроинструментов **Taketool** (ex-ToolBox)
+через умные боксы с замками Kerong.
+
+**Полный актуальный справочник проекта — [GUIDE.md](./GUIDE.md).**
 
 ## Стек
-- **Backend:** Node.js + Express (деплой на Vercel)
-- **БД:** Supabase (PostgreSQL + PostGIS)
-- **Авторизация:** JWT + SMS-верификация
-- **IoT/Замки:** Kerong LCS API (Docker) → KR-BU → KR-CU → электрозамки
-- **Оплата:** Payme / Click
-- **Приложение:** Flutter (отдельный репозиторий toolbox-app)
+- **Backend:** Node.js + Express (деплой на Vercel: `toolbox-backend-eight.vercel.app`)
+- **БД:** Supabase (PostgreSQL), RLS включён, бэкенд ходит secret-ключом
+- **Авторизация:** JWT (30 дней) + SMS-верификация (Eskiz.uz, боевой режим)
+- **IoT/Замки:** Kerong LCS (docker kerong-api на мини-ПК точки) → KR-BU → KR-CU16 → замки KR-S99N
+- **Оплата:** Payme ✅ (боевой) и Click ✅ (код готов)
+- **Приложение:** Flutter (репозиторий toolbox-app), админка — toolbox-admin
 
 ## Архитектура
 ```
-Flutter App → ToolBox Backend (Vercel) → Kerong LCS (Docker, локально) → KR-BU → KR-CU → Замки
-                  ↕                              ↕
-              Supabase (БД)              Cloudflare Tunnel
-              Payme/Click
+Flutter App → Taketool Backend (Vercel) → cloudflared-туннель → lcs-guard (мини-ПК)
+                  ↕                                                  ↓
+              Supabase (БД)                              Kerong LCS → KR-BU → замки
+              Payme / Click (колбэки с их серверов)
 ```
 
 ## Запуск
@@ -32,17 +35,21 @@ npm run dev
 src/
 ├── index.js              — Express app, точка входа
 ├── lib/
-│   ├── supabase.js       — клиент Supabase
-│   ├── sms.js            — SMS-модуль (console/eskiz)
-│   └── kerong.js         — [TODO] клиент Kerong LCS API
+│   ├── supabase.js       — клиент Supabase (secret-ключ, в обход RLS)
+│   ├── sms.js            — SMS-модуль (console/eskiz), текст = одобренный шаблон Eskiz
+│   ├── kerong.js         — клиент docker-API Kerong LCS (ретраи, X-ToolBox-Secret)
+│   └── click_mapi.js     — Click Merchant API (Create Invoice)
 ├── middleware/
 │   └── auth.js           — JWT-верификация
 └── routes/
-    ├── auth.js           — авторизация (send-code, verify)
-    ├── boxes.js          — боксы (список, детали)
+    ├── auth.js           — авторизация (send-code, verify, me)
+    ├── boxes.js          — боксы (список с расстоянием, детали, инструменты)
     ├── tools.js          — инструменты (поиск, детали)
-    ├── rentals.js        — аренды (создать, продлить, вернуть)
-    └── notifications.js  — уведомления
+    ├── rentals.js        — аренды (создать+оплата, продлить, вернуть, поллинг оплаты)
+    ├── notifications.js  — уведомления
+    ├── locks.js          — сервисные роуты замков (только с X-Admin-Secret)
+    ├── payme.js          — Payme Merchant API (JSON-RPC, колбэки Payme)
+    └── click.js          — Click SHOP API (Prepare/Complete, страница /return)
 ```
 
 ## API Endpoints
@@ -50,36 +57,34 @@ src/
 ### Авторизация
 - `POST /api/auth/send-code` — отправить SMS-код
 - `POST /api/auth/verify` — проверить код, получить JWT
+- `GET/PATCH /api/auth/me` — профиль
 
 ### Боксы и инструменты
-- `GET /api/boxes` — список боксов
-- `GET /api/boxes/:id` — детали бокса
-- `GET /api/boxes/:id/tools` — инструменты в боксе
-- `GET /api/tools/search?q=` — поиск инструмента
-- `GET /api/tools/:id` — детали инструмента
+- `GET /api/boxes?lat&lng` — список боксов (сортировка по расстоянию)
+- `GET /api/boxes/:id`, `GET /api/boxes/:id/tools` — детали, инструменты
+- `GET /api/tools/search?q=`, `GET /api/tools/:id` — поиск, детали
 
-### Аренда
-- `POST /api/rentals` — создать аренду (+ открыть замок через Kerong)
-- `POST /api/rentals/:id/extend` — продлить аренду
-- `POST /api/rentals/:id/return` — вернуть инструмент (+ открыть замок)
-- `GET /api/rentals/active` — активные аренды
-- `GET /api/rentals/history` — история аренд
+### Аренда (JWT)
+- `POST /api/rentals` — создать аренду в `pending_payment` (+`provider`: payme/click → ссылка/инвойс)
+- `GET /api/rentals/:id/payment-status` — поллинг оплаты (ссылка своего провайдера)
+- `POST /api/rentals/:id/extend` — продлить (только active/overdue)
+- `POST /api/rentals/:id/return` — вернуть, открыть замок (только active/overdue)
+- `GET /api/rentals/active` / `/history` / `/:id`
 
-### Kerong IoT (TODO)
-- `POST /api/locks/open` — открыть замок (проксирует на Kerong LCS)
-- `GET /api/locks/status` — статус замков
+### Платёжные колбэки (вызывают Payme/Click со своих серверов)
+- `POST /api/payments/payme` (алиас `/api/payme`) — Merchant API JSON-RPC
+- `POST /api/payments/click/prepare` / `/complete` — SHOP API (md5-подпись)
+- `GET /api/payments/click/return` — страница возврата после оплаты
+
+### Сервисные (заголовок `X-Admin-Secret: $ADMIN_API_SECRET`, иначе 404)
+- `POST /api/locks/open` — открыть замок `{zoneId, lockNumber}` (0-based)
+- `GET /api/locks/status` — статус подключения к LCS
+- `GET /api/locks/free/:zoneId` — свободные ячейки по датчикам
 
 ## Переменные окружения
-```
-SUPABASE_URL=https://zwzmcihwtwgjajjjsbms.supabase.co
-SUPABASE_KEY=***
-JWT_SECRET=***
-SMS_PROVIDER=console
-KERONG_LCS_URL=http://localhost:9777  # адрес Kerong LCS сервера
-KERONG_LCS_USER=admin                # логин LCS
-KERONG_LCS_PASSWORD=***              # пароль LCS
-PORT=3000
-```
+Полная таблица с назначением — в [GUIDE.md](./GUIDE.md#4-переменные-окружения-vercel--toolbox-backend).
+Кратко: `SUPABASE_URL/KEY`, `JWT_SECRET`, `SMS_PROVIDER`+`ESKIZ_*`, `PAYME_*`,
+`CLICK_*` (5 шт.), `KERONG_LCS_URL/SECRET` + `KERONG_BOARD_*`, `ADMIN_API_SECRET`.
 
-## Статус
-См. [PLAN.md](./PLAN.md) для текущего плана и прогресса.
+⚠️ Значения в Vercel заливать через bash: `printf '%s' 'VALUE' | npx vercel env add NAME production`
+(PowerShell-pipe дописывает `\r`).
