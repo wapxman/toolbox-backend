@@ -249,8 +249,21 @@ router.get('/return', (req, res) => {
   <div class="ok"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"
        stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></div>
   <h1>Оплата обработана</h1>
-  <p>Вернитесь в приложение <b>Taketool</b> — статус аренды обновится автоматически.</p>
-</div></body></html>`);
+  <p id="hint">Возвращаем вас в приложение <b>Taketool</b>…</p>
+  <p><a id="btn" href="taketool://payment" style="display:inline-block;margin-top:14px;
+     padding:12px 22px;background:#E02020;color:#fff;border-radius:10px;
+     text-decoration:none;font-weight:600">Открыть Taketool</a></p>
+</div>
+<script>
+  // Пытаемся вернуть пользователя в приложение сами (deep link).
+  // Если приложение не поставлено/схема не сработала — остаётся кнопка.
+  setTimeout(function () { window.location.href = 'taketool://payment'; }, 400);
+  setTimeout(function () {
+    document.getElementById('hint').textContent =
+      'Вернитесь в приложение Taketool — статус аренды обновится автоматически.';
+  }, 2500);
+</script>
+</body></html>`);
 });
 
 module.exports = router;
