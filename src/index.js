@@ -10,6 +10,7 @@ const notificationRoutes = require('./routes/notifications');
 const lockRoutes = require('./routes/locks');
 const paymeRoutes = require('./routes/payme');
 const clickRoutes = require('./routes/click');
+const cronRoutes = require('./routes/cron');
 const kerong = require('./lib/kerong');
 
 const app = express();
@@ -42,6 +43,8 @@ app.use('/api/payme', paymeRoutes);
 // Click SHOP API: /api/payments/click/prepare и /complete — эти URL прописываем
 // в кабинете merchant.click.uz (Сервисы → адреса проверки и результата).
 app.use('/api/payments/click', clickRoutes);
+// Cron-задачи Vercel (защищены CRON_SECRET)
+app.use('/api/cron', cronRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
