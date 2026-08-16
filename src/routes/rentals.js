@@ -353,11 +353,22 @@ router.post('/:id/return', async (req, res) => {
       return res.status(400).json({ error: 'Аренда не активна — возврат невозможен' });
     }
 
-    // Открываем замок для возврата через Kerong
+    // Открываем замок для возврата через Kerong. Если замок недоступен
+    // (бокс офлайн / туннель упал) — НЕ завершаем аренду: пользователь у бокса
+    // ничего не смог положить. Отдаём понятную ошибку 503, а не общий 500.
     const cell = rental.tools.cells;
     const zoneId = cell.boxes.kerong_zone_id || 1;
     const lockNumber = cell.kerong_lock_number ?? (cell.cell_number - 1);
-    await kerong.openLock(zoneId, lockNumber);
+    try {
+      await kerong.openLock(zoneId, lockNumber);
+    } catch (lockErr) {
+      console.error('return: lock open failed', lockErr.message);
+      return res.status(503).json({
+        error: 'Не удалось открыть замок ячейки. Попробуйте ещё раз через минуту. ' +
+               'Если не помогает — обратитесь в поддержку, аренда останется активной.',
+        lock_failed: true,
+      });
+    }
 
     const now = new Date();
     const expectedEnd = new Date(rental.expected_end);
