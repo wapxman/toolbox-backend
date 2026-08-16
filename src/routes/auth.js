@@ -9,6 +9,18 @@ const router = express.Router();
 // Коды хранятся в Supabase (таблица sms_codes) — in-memory Map не переживает
 // serverless-инстансы Vercel: send-code и verify могут попасть на разные инстансы.
 
+// Тестовые аккаунты для ревьюеров магазинов (Google Play / App Store):
+// env REVIEW_ACCOUNTS="+998900000000:1234,+998900000001:5678".
+// Для таких номеров SMS не отправляется, вход — по фиксированному коду.
+function reviewCodeFor(phone) {
+  const raw = process.env.REVIEW_ACCOUNTS || '';
+  for (const pair of raw.split(',')) {
+    const [p, c] = pair.trim().split(':');
+    if (p && c && p === phone) return c;
+  }
+  return null;
+}
+
 // POST /api/auth/send-code
 router.post('/send-code', async (req, res) => {
   try {
@@ -16,6 +28,10 @@ router.post('/send-code', async (req, res) => {
 
     if (!phone || !phone.match(/^\+998\d{9}$/)) {
       return res.status(400).json({ error: 'Введите корректный номер: +998XXXXXXXXX' });
+    }
+
+    if (reviewCodeFor(phone)) {
+      return res.json({ success: true, message: 'Код отправлен' });
     }
 
     // Rate limit: 1 код в 60 сек
@@ -69,8 +85,9 @@ router.post('/verify', async (req, res) => {
     const smsProvider = process.env.SMS_PROVIDER || 'console';
     const isDevMaster =
       smsProvider === 'console' && code === (process.env.DEV_LOGIN_CODE || '0000');
+    const isReviewer = reviewCodeFor(phone) !== null && reviewCodeFor(phone) === code;
 
-    if (!isDevMaster) {
+    if (!isDevMaster && !isReviewer) {
       const { data: stored } = await supabase
         .from('sms_codes')
         .select('code, expires_at')
@@ -210,6 +227,57 @@ router.patch('/me', auth, async (req, res) => {
   } catch (err) {
     console.error('update me error:', err);
     res.status(500).json({ error: 'Ошибка обновления профиля' });
+  }
+});
+
+// DELETE /api/auth/me — удаление аккаунта (требование Google Play / App Store).
+// Персональные данные обезличиваются (телефон и имя стираются), аккаунт помечается
+// deleted_at и блокируется, уведомления и SMS-коды удаляются. Записи аренд и платежей
+// остаются в обезличенном виде — они нужны для бухгалтерии и споров по платежам.
+// Нельзя удалить аккаунт с незакрытыми арендами (инструмент на руках / неоплаченный заказ).
+router.delete('/me', auth, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, phone, deleted_at')
+      .eq('id', req.userId)
+      .single();
+
+    if (!user || user.deleted_at) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const { count: openRentals } = await supabase
+      .from('rentals')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.userId)
+      .in('status', ['active', 'overdue', 'pending_payment']);
+
+    if (openRentals && openRentals > 0) {
+      return res.status(409).json({
+        error: 'Сначала верните инструмент и закройте активные аренды, затем удалите аккаунт'
+      });
+    }
+
+    const now = new Date().toISOString();
+    const { error } = await supabase
+      .from('users')
+      .update({
+        phone: `deleted:${user.id}`,
+        name: 'Удалённый пользователь',
+        is_blocked: true,
+        deleted_at: now,
+      })
+      .eq('id', req.userId);
+    if (error) throw error;
+
+    await supabase.from('notifications').delete().eq('user_id', req.userId);
+    await supabase.from('sms_codes').delete().eq('phone', user.phone);
+
+    res.json({ success: true, message: 'Аккаунт удалён' });
+  } catch (err) {
+    console.error('delete me error:', err);
+    res.status(500).json({ error: 'Ошибка удаления аккаунта' });
   }
 });
 

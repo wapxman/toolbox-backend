@@ -82,6 +82,10 @@
 | `KERONG_LCS_SECRET` | заголовок X-ToolBox-Secret для привратника lcs-guard на мини-ПК |
 | `KERONG_BOARD_IP/PORT/TYPE` | адрес платы KR-BU (дефолты 192.168.0.7 / 23 / CU_16) |
 | `ADMIN_API_SECRET` | заголовок X-Admin-Secret для сервисных роутов /api/locks/* (без него роуты выключены) |
+| `CRON_SECRET` | Bearer для Vercel Cron `/api/cron/overdue` (без него роут выключен) |
+| `REVIEW_ACCOUNTS` | тест-аккаунты для ревьюеров Google Play / App Store: `+998900000001:1234,...` — SMS не шлётся, вход по фиксированному коду. Прод: `+998 90 000 00 01` / код `1234` |
+
+**Удаление аккаунта:** `DELETE /api/auth/me` (JWT) — обезличивает users (phone→`deleted:<id>`, name, is_blocked, deleted_at), чистит notifications/sms_codes, аренды остаются обезличенными. Отказ 409 при открытых арендах. Middleware auth теперь сверяет пользователя с БД (удалённый → 401, заблокированный → 403). Веб-форма удаления: https://taketool.uz/delete-account.html
 
 ---
 
