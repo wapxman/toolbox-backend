@@ -9,9 +9,10 @@ const router = express.Router();
 // Коды хранятся в Supabase (таблица sms_codes) — in-memory Map не переживает
 // serverless-инстансы Vercel: send-code и verify могут попасть на разные инстансы.
 
-// Тестовые аккаунты для ревьюеров магазинов (Google Play / App Store):
+// Тестовые аккаунты для ревьюеров магазинов (Google Play / App Store) и демо-показов:
 // env REVIEW_ACCOUNTS="+998900000000:1234,+998900000001:5678".
 // Для таких номеров SMS не отправляется, вход — по фиксированному коду.
+// Код "*" означает «принимать любой код» — для демо-номеров, чтобы не помнить пару.
 function reviewCodeFor(phone) {
   const raw = process.env.REVIEW_ACCOUNTS || '';
   for (const pair of raw.split(',')) {
@@ -19,6 +20,14 @@ function reviewCodeFor(phone) {
     if (p && c && p === phone) return c;
   }
   return null;
+}
+
+// Совпал ли введённый код с тест-аккаунтом. Пустой код не принимаем никогда,
+// даже для "*": /verify выше уже требует непустой code, это вторая линия.
+function isReviewLogin(phone, code) {
+  const expected = reviewCodeFor(phone);
+  if (expected === null || !code) return false;
+  return expected === '*' || expected === code;
 }
 
 // POST /api/auth/send-code
@@ -85,7 +94,7 @@ router.post('/verify', async (req, res) => {
     const smsProvider = process.env.SMS_PROVIDER || 'console';
     const isDevMaster =
       smsProvider === 'console' && code === (process.env.DEV_LOGIN_CODE || '0000');
-    const isReviewer = reviewCodeFor(phone) !== null && reviewCodeFor(phone) === code;
+    const isReviewer = isReviewLogin(phone, code);
 
     if (!isDevMaster && !isReviewer) {
       const { data: stored } = await supabase
