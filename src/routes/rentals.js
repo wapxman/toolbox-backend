@@ -2,50 +2,102 @@ const express = require('express');
 const supabase = require('../lib/supabase');
 const kerong = require('../lib/kerong');
 const clickMapi = require('../lib/click_mapi');
+const orders = require('../lib/orders');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
 router.use(auth);
 
-// Ценовые правила редактируются в админке (app_settings, key='pricing');
-// при недоступности таблицы работаем на прежних дефолтах. Кэш 60 сек.
-const DEFAULT_PRICING = { discount3_pct: 20, discount7_pct: 35, overdue_multiplier: 1.5 };
-let pricingCache = { value: DEFAULT_PRICING, ts: 0 };
-async function getPricing() {
-  if (Date.now() - pricingCache.ts < 60_000) return pricingCache.value;
-  try {
-    const { data } = await supabase
-      .from('app_settings').select('value').eq('key', 'pricing').maybeSingle();
-    pricingCache = { value: { ...DEFAULT_PRICING, ...(data?.value || {}) }, ts: Date.now() };
-  } catch {
-    pricingCache.ts = Date.now();
+const { getPricing, calculatePrice } = orders;
+
+const ACTIVE_STATUSES = ['active', 'overdue', 'pending_delivery'];
+const RENTAL_SELECT = `
+  *,
+  tools (
+    id, name, category, brand, photo_url, day_price, sale_price,
+    cells ( cell_number, qr_code, boxes ( id, name, address ) )
+  )
+`;
+
+// Собираем ответ с платёжной ссылкой (Payme — checkout, Click — счёт в Click Up + ссылка)
+async function paymentResponse(res, rental, tool, provider, userId, message) {
+  const totalPrice = rental.total_price;
+  if (provider === 'click') {
+    const { data: usr } = await supabase.from('users').select('phone').eq('id', userId).single();
+    const inv = await clickMapi.createInvoice({ phone: usr?.phone, amount: totalPrice, merchantTransId: rental.id });
+    if (inv && Number(inv.error_code) === 0 && inv.invoice_id) {
+      return res.json({
+        rental, tool_name: tool?.name, total_price: totalPrice, provider: 'click',
+        click_invoice: true, invoice_id: inv.invoice_id,
+        payment_url: buildClickUrl(rental.id, totalPrice),
+        message: 'Счёт отправлен в приложение Click. Откройте Click и подтвердите оплату.',
+      });
+    }
+    console.error('click invoice failed:', inv);
+    return res.json({
+      rental, tool_name: tool?.name, total_price: totalPrice, provider: 'click',
+      click_invoice: false, payment_url: buildClickUrl(rental.id, totalPrice),
+      message: 'Счёт не удалось отправить в Click — откроем страницу оплаты.',
+    });
   }
-  return pricingCache.value;
+  return res.json({
+    rental, tool_name: tool?.name, total_price: totalPrice, provider: 'payme',
+    payment_url: buildPaymeUrl(rental.id, totalPrice), message,
+  });
 }
 
-function calculatePrice(dayPrice, days, pricing = DEFAULT_PRICING) {
-  if (days >= 7) return Math.round(days * dayPrice * (1 - pricing.discount7_pct / 100));
-  if (days >= 3) return Math.round(days * dayPrice * (1 - pricing.discount3_pct / 100));
-  return days * dayPrice;
+// Разбор и валидация блока доставки из тела запроса
+async function parseDelivery(body, fallbackPhone) {
+  const d = body.delivery || {};
+  const address = String(d.address || '').trim();
+  if (address.length < 5) return { error: 'Укажите адрес доставки' };
+  const phone = String(d.phone || fallbackPhone || '').trim();
+  if (phone.length < 9) return { error: 'Укажите телефон получателя' };
+  const slot = await orders.resolveSlot(d.slot);
+  if (slot.error) return { error: slot.error };
+  return {
+    fields: {
+      delivery_address: address,
+      delivery_entrance: d.entrance ? String(d.entrance).slice(0, 20) : null,
+      delivery_floor: d.floor ? String(d.floor).slice(0, 20) : null,
+      delivery_apt: d.apt ? String(d.apt).slice(0, 20) : null,
+      delivery_lat: typeof d.lat === 'number' ? d.lat : null,
+      delivery_lng: typeof d.lng === 'number' ? d.lng : null,
+      delivery_slot_start: slot.start,
+      delivery_slot_end: slot.end,
+      delivery_slot_label: slot.label,
+      recipient_phone: phone,
+      delivery_comment: d.comment ? String(d.comment).slice(0, 500) : null,
+    },
+  };
 }
 
-// POST /api/rentals — создать аренду + открыть замок
+// POST /api/rentals — создать заказ: аренда или покупка, из бокса или с доставкой.
+// body: { tool_id, kind: rent|buy, days, fulfillment: pickup|delivery, provider, delivery{...} }
 router.post('/', async (req, res) => {
   try {
-    const { tool_id, days, provider } = req.body;
+    const body = req.body || {};
+    const tool_id = body.tool_id;
+    const kind = body.kind === 'buy' ? 'buy' : 'rent';
+    const fulfillment = body.fulfillment === 'delivery' ? 'delivery' : 'pickup';
+    const provider = body.provider === 'click' ? 'click' : 'payme';
+    const days = kind === 'rent' ? Number(body.days) : 0;
 
-    if (!tool_id || !days || days < 1 || days > 30) {
-      return res.status(400).json({ error: 'Укажите инструмент и количество дней (1-30)' });
+    if (!tool_id) return res.status(400).json({ error: 'Укажите инструмент' });
+    if (kind === 'rent' && (!days || days < 1 || days > 30)) {
+      return res.status(400).json({ error: 'Укажите количество дней (1-30)' });
     }
 
-    const { count: activeCount } = await supabase
-      .from('rentals')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', req.userId)
-      .in('status', ['active', 'overdue']);
-
-    if (activeCount >= 3) {
-      return res.status(400).json({ error: 'Максимум 3 активных аренды одновременно' });
+    if (kind === 'rent') {
+      const { count: activeCount } = await supabase
+        .from('rentals')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', req.userId)
+        .eq('kind', 'rent')
+        .in('status', ACTIVE_STATUSES);
+      if (activeCount >= 3) {
+        return res.status(400).json({ error: 'Максимум 3 активных аренды одновременно' });
+      }
     }
 
     const { data: tool, error: toolErr } = await supabase
@@ -53,92 +105,63 @@ router.post('/', async (req, res) => {
       .select('*, cells(*, boxes(*))')
       .eq('id', tool_id)
       .single();
-
-    if (toolErr || !tool) {
-      return res.status(404).json({ error: 'Инструмент не найден' });
+    if (toolErr || !tool) return res.status(404).json({ error: 'Инструмент не найден' });
+    if (tool.status && tool.status !== 'available') {
+      return res.status(400).json({ error: 'Инструмент больше не доступен' });
+    }
+    if (tool.cells?.status !== 'free') return res.status(400).json({ error: 'Инструмент уже занят' });
+    if (kind === 'buy' && !(tool.sale_price > 0)) {
+      return res.status(400).json({ error: 'Этот инструмент не продаётся' });
     }
 
-    if (tool.cells.status !== 'free') {
-      return res.status(400).json({ error: 'Инструмент уже занят' });
+    // Цена
+    const pricing = await getPricing();
+    const itemsPrice = kind === 'buy' ? tool.sale_price : days * tool.day_price;
+    const discount = kind === 'buy' ? 0 : itemsPrice - calculatePrice(tool.day_price, days, pricing);
+    let deliveryFee = 0;
+    let deliveryFields = {};
+    if (fulfillment === 'delivery') {
+      const { data: usr } = await supabase.from('users').select('phone').eq('id', req.userId).single();
+      const parsed = await parseDelivery(body, usr?.phone);
+      if (parsed.error) return res.status(400).json({ error: parsed.error });
+      deliveryFields = parsed.fields;
+      deliveryFee = (await orders.getDelivery()).fee || 0;
     }
+    const totalPrice = itemsPrice - discount + deliveryFee;
 
-    const totalPrice = calculatePrice(tool.day_price, days, await getPricing());
+    // started_at/expected_end предварительные: для доставки пересчитаются при передаче
     const startedAt = new Date();
     const expectedEnd = new Date(startedAt);
-    expectedEnd.setDate(expectedEnd.getDate() + days);
+    expectedEnd.setDate(expectedEnd.getDate() + (days || 0));
 
-    // Аренда создаётся в статусе pending_payment.
-    // Замок откроется в Payme PerformTransaction — после реальной оплаты.
     const { data: rental, error: rentalErr } = await supabase
       .from('rentals')
       .insert({
         user_id: req.userId,
-        tool_id: tool_id,
-        days: days,
+        tool_id,
+        kind,
+        fulfillment,
+        days: days || 0,
         started_at: startedAt.toISOString(),
         expected_end: expectedEnd.toISOString(),
         status: 'pending_payment',
+        items_price: itemsPrice,
+        discount,
+        delivery_fee: deliveryFee,
         total_price: totalPrice,
-        payment_provider: provider === 'click' ? 'click' : 'payme'
+        payment_provider: provider,
+        ...deliveryFields,
       })
       .select()
       .single();
-
     if (rentalErr) throw rentalErr;
 
-    // Ячейку НЕ резервируем до оплаты: иначе брошенная (неоплаченная) аренда
-    // держала бы инструмент «Занят» навсегда. Ячейка помечается occupied только
-    // после реального подтверждения оплаты — в Payme PerformTransaction.
-
-    if (provider === 'click') {
-      // Метод 3 (Create Invoice): счёт с суммой прилетает пушем в приложение
-      // Click Up на номер пользователя (как Payme). Подтверждение оплаты придёт
-      // к нам через SHOP API Prepare/Complete. Телефон берём из профиля (вариант Б).
-      const { data: usr } = await supabase
-        .from('users').select('phone').eq('id', req.userId).single();
-      const inv = await clickMapi.createInvoice({
-        phone: usr?.phone,
-        amount: totalPrice,
-        merchantTransId: rental.id,
-      });
-      if (inv && Number(inv.error_code) === 0 && inv.invoice_id) {
-        return res.json({
-          rental,
-          tool_name: tool.name,
-          total_price: totalPrice,
-          provider: 'click',
-          click_invoice: true,
-          invoice_id: inv.invoice_id,
-          // Ссылку отдаём, чтобы приложение сразу открыло Click (как Payme).
-          // Счёт с суммой уже в Click Up; ссылка нужна лишь для перехода в приложение.
-          payment_url: buildClickUrl(rental.id, totalPrice),
-          message: 'Счёт отправлен в приложение Click. Откройте Click и подтвердите оплату.',
-        });
-      }
-      // Фолбэк: инвойс не создался (напр. номер не в Click) — отдаём платёжную ссылку.
-      console.error('click invoice failed:', inv);
-      return res.json({
-        rental,
-        tool_name: tool.name,
-        total_price: totalPrice,
-        provider: 'click',
-        click_invoice: false,
-        payment_url: buildClickUrl(rental.id, totalPrice),
-        message: 'Счёт не удалось отправить в Click — откроем страницу оплаты.',
-      });
-    }
-
-    res.json({
-      rental,
-      tool_name: tool.name,
-      total_price: totalPrice,
-      provider: 'payme',
-      payment_url: buildPaymeUrl(rental.id, totalPrice),
-      message: 'Аренда создана. Оплатите, чтобы открыть замок.'
-    });
+    // Ячейку НЕ резервируем до оплаты (см. orders.confirmPayment).
+    return paymentResponse(res, rental, tool, provider, req.userId,
+      kind === 'buy' ? 'Заказ создан. Оплатите покупку.' : 'Аренда создана. Оплатите, чтобы открыть замок.');
   } catch (err) {
     console.error('create rental error:', err);
-    res.status(500).json({ error: 'Ошибка создания аренды' });
+    res.status(500).json({ error: 'Ошибка создания заказа' });
   }
 });
 
@@ -151,8 +174,7 @@ function buildPaymeUrl(rentalId, priceSum) {
   return `${base}/${Buffer.from(payload).toString('base64')}`;
 }
 
-// Ссылка на оплату Click: my.click.uz/services/pay (сумма в СУМАХ, transaction_param = rental_id).
-// merchant_trans_id, который Click вернёт в Prepare/Complete — это наш rental_id.
+// Ссылка на оплату Click (сумма в СУМАХ, transaction_param = rental_id)
 function buildClickUrl(rentalId, priceSum) {
   const serviceId = process.env.CLICK_SERVICE_ID;
   const merchantId = process.env.CLICK_MERCHANT_ID;
@@ -172,25 +194,26 @@ router.get('/:id/payment-status', async (req, res) => {
   try {
     const { data: rental, error } = await supabase
       .from('rentals')
-      .select('id, status, total_price, payment_provider')
+      .select('id, status, total_price, payment_provider, kind, fulfillment, delivery_status, delivery_slot_label')
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
+    if (error || !rental) return res.status(404).json({ error: 'Заказ не найден' });
 
-    if (error || !rental) {
-      return res.status(404).json({ error: 'Аренда не найдена' });
-    }
-
+    const paid = !['pending_payment', 'cancelled'].includes(rental.status);
     res.json({
       rental_id: rental.id,
       status: rental.status,
+      kind: rental.kind,
+      fulfillment: rental.fulfillment,
+      delivery_slot_label: rental.delivery_slot_label,
       provider: rental.payment_provider || 'payme',
-      paid: rental.status === 'active',
+      paid,
       payment_url: rental.status === 'pending_payment'
         ? (rental.payment_provider === 'click'
             ? buildClickUrl(rental.id, rental.total_price)
             : buildPaymeUrl(rental.id, rental.total_price))
-        : null
+        : null,
     });
   } catch (err) {
     console.error('payment-status error:', err);
@@ -198,40 +221,35 @@ router.get('/:id/payment-status', async (req, res) => {
   }
 });
 
-// GET /api/rentals/active
+// GET /api/rentals/active — активные аренды и заказы в доставке (кроме дочерних возвратов)
 router.get('/active', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('rentals')
-      .select(`
-        *,
-        tools (
-          name, category, brand, photo_url, day_price,
-          cells ( cell_number, boxes ( name, address ) )
-        )
-      `)
+      .select(RENTAL_SELECT)
       .eq('user_id', req.userId)
-      .in('status', ['active', 'overdue'])
-      .order('started_at', { ascending: false });
-
+      .in('status', ACTIVE_STATUSES)
+      .neq('kind', 'courier_return')
+      .order('created_at', { ascending: false });
     if (error) throw error;
     res.json(data);
   } catch (err) {
     console.error('active rentals error:', err);
-    res.status(500).json({ error: 'Ошибка загрузки аренд' });
+    res.status(500).json({ error: 'Ошибка загрузки заказов' });
   }
 });
 
-// GET /api/rentals/history
+// GET /api/rentals/history — завершённые и отменённые заказы
 router.get('/history', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('rentals')
-      .select(`*, tools ( name, category, brand, photo_url, day_price )`)
+      .select(RENTAL_SELECT)
       .eq('user_id', req.userId)
-      .eq('status', 'completed')
-      .order('started_at', { ascending: false });
-
+      .in('status', ['completed', 'cancelled'])
+      .neq('kind', 'courier_return')
+      .order('created_at', { ascending: false })
+      .limit(100);
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -240,30 +258,45 @@ router.get('/history', async (req, res) => {
   }
 });
 
-// GET /api/rentals/:id
+// GET /api/rentals/:id — заказ + активный вызов курьера (если есть)
 router.get('/:id', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('rentals')
-      .select(`
-        *,
-        tools (
-          name, category, brand, photo_url, day_price, specs,
-          cells ( cell_number, qr_code, boxes ( id, name, address ) )
-        )
-      `)
+      .select(RENTAL_SELECT)
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
+    if (error || !data) return res.status(404).json({ error: 'Заказ не найден' });
 
-    if (error || !data) {
-      return res.status(404).json({ error: 'Аренда не найдена' });
-    }
-
-    res.json(data);
+    const { data: ret } = await supabase
+      .from('rentals')
+      .select('id, status, delivery_status, delivery_slot_label, courier_name, courier_phone, total_price')
+      .eq('parent_rental_id', data.id)
+      .in('status', ['pending_payment', 'pending_delivery'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    res.json({ ...data, courier_return: ret || null });
   } catch (err) {
     console.error('rental detail error:', err);
     res.status(500).json({ error: 'Ошибка' });
+  }
+});
+
+// POST /api/rentals/:id/cancel — отмена клиентом (до передачи курьеру)
+router.post('/:id/cancel', async (req, res) => {
+  try {
+    const rental = await orders.loadRental(req.params.id);
+    if (!rental || rental.user_id !== req.userId) return res.status(404).json({ error: 'Заказ не найден' });
+    const r = await orders.cancelOrder(rental, 'user');
+    if (r.error) return res.status(400).json({ error: r.error });
+    res.json({ ok: true, message: r.refund_required
+      ? 'Заказ отменён. Деньги вернутся тем же способом оплаты в течение 1–3 дней.'
+      : 'Заказ отменён.' });
+  } catch (err) {
+    console.error('cancel error:', err);
+    res.status(500).json({ error: 'Ошибка отмены' });
   }
 });
 
@@ -271,27 +304,18 @@ router.get('/:id', async (req, res) => {
 router.post('/:id/extend', async (req, res) => {
   try {
     const { extra_days } = req.body;
-
     if (!extra_days || extra_days < 1) {
       return res.status(400).json({ error: 'Укажите количество дополнительных дней' });
     }
-
     const { data: rental, error: rErr } = await supabase
       .from('rentals')
       .select('*, tools(day_price, name)')
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
-
-    if (rErr || !rental) {
-      return res.status(404).json({ error: 'Аренда не найдена' });
-    }
-
-    if (rental.status === 'completed') {
-      return res.status(400).json({ error: 'Аренда уже завершена' });
-    }
-    // Продлевать можно только оплаченную аренду — иначе pending_payment/cancelled
-    // «оживали» бы в active без оплаты.
+    if (rErr || !rental) return res.status(404).json({ error: 'Аренда не найдена' });
+    if (rental.kind !== 'rent') return res.status(400).json({ error: 'Продлевать можно только аренду' });
+    if (rental.status === 'completed') return res.status(400).json({ error: 'Аренда уже завершена' });
     if (!['active', 'overdue'].includes(rental.status)) {
       return res.status(400).json({ error: 'Аренда не активна — продление невозможно' });
     }
@@ -303,26 +327,14 @@ router.post('/:id/extend', async (req, res) => {
 
     const { data: updated, error: uErr } = await supabase
       .from('rentals')
-      .update({
-        days: newDays,
-        expected_end: newEnd.toISOString(),
-        total_price: rental.total_price + extraPrice,
-        status: 'active'
-      })
+      .update({ days: newDays, expected_end: newEnd.toISOString(), total_price: rental.total_price + extraPrice, status: 'active' })
       .eq('id', req.params.id)
       .select()
       .single();
-
     if (uErr) throw uErr;
 
-    await supabase.from('notifications').insert({
-      user_id: req.userId,
-      rental_id: rental.id,
-      type: 'payment',
-      title: 'Аренда продлена',
-      message: `${rental.tools.name} — +${extra_days} дн., доплата ${extraPrice.toLocaleString('ru-RU')} сум`
-    });
-
+    await orders.notifyUser(req.userId, rental.id, 'payment', 'Аренда продлена',
+      `${rental.tools.name} — +${extra_days} дн., доплата ${extraPrice.toLocaleString('ru-RU')} сум`);
     res.json({ rental: updated, extra_price: extraPrice, message: `Аренда продлена на ${extra_days} дн.` });
   } catch (err) {
     console.error('extend error:', err);
@@ -330,7 +342,7 @@ router.post('/:id/extend', async (req, res) => {
   }
 });
 
-// POST /api/rentals/:id/return — вернуть инструмент + открыть замок
+// POST /api/rentals/:id/return — вернуть инструмент В БОКС (открыть замок)
 router.post('/:id/return', async (req, res) => {
   try {
     const { data: rental, error: rErr } = await supabase
@@ -339,23 +351,16 @@ router.post('/:id/return', async (req, res) => {
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
-
-    if (rErr || !rental) {
-      return res.status(404).json({ error: 'Аренда не найдена' });
-    }
-
-    if (rental.status === 'completed') {
-      return res.status(400).json({ error: 'Уже возвращён' });
-    }
-    // Замок открывается только по оплаченной (активной/просроченной) аренде —
-    // pending_payment/cancelled сюда не проходят, иначе инструмент выдаётся бесплатно.
+    if (rErr || !rental) return res.status(404).json({ error: 'Аренда не найдена' });
+    if (rental.kind !== 'rent') return res.status(400).json({ error: 'Это не аренда' });
+    if (rental.status === 'completed') return res.status(400).json({ error: 'Уже возвращён' });
     if (!['active', 'overdue'].includes(rental.status)) {
       return res.status(400).json({ error: 'Аренда не активна — возврат невозможен' });
     }
+    if (rental.return_method === 'courier') {
+      return res.status(400).json({ error: 'Вы уже вызвали курьера за инструментом. Отмените вызов, чтобы сдать в бокс.' });
+    }
 
-    // Открываем замок для возврата через Kerong. Если замок недоступен
-    // (бокс офлайн / туннель упал) — НЕ завершаем аренду: пользователь у бокса
-    // ничего не смог положить. Отдаём понятную ошибку 503, а не общий 500.
     const cell = rental.tools.cells;
     const zoneId = cell.boxes.kerong_zone_id || 1;
     const lockNumber = cell.kerong_lock_number ?? (cell.cell_number - 1);
@@ -373,52 +378,94 @@ router.post('/:id/return', async (req, res) => {
     const now = new Date();
     const expectedEnd = new Date(rental.expected_end);
     let overdueFee = 0;
-
     if (now > expectedEnd) {
       const { overdue_multiplier } = await getPricing();
-      const overdueDays = Math.ceil((now - expectedEnd) / (1000 * 60 * 60 * 24));
+      const overdueDays = Math.ceil((now - expectedEnd) / 86_400_000);
       overdueFee = Math.round(overdueDays * (rental.total_price / rental.days) * overdue_multiplier);
     }
 
     const { data: updated, error: uErr } = await supabase
       .from('rentals')
-      .update({
-        actual_end: now.toISOString(),
-        status: 'completed',
-        overdue_fee: overdueFee
-      })
+      .update({ actual_end: now.toISOString(), status: 'completed', overdue_fee: overdueFee, return_method: 'box' })
       .eq('id', req.params.id)
       .select()
       .single();
-
     if (uErr) throw uErr;
 
-    await supabase
-      .from('cells')
-      .update({ status: 'free' })
-      .eq('id', rental.tools.cell_id);
-
-    await supabase.from('notifications').insert({
-      user_id: req.userId,
-      rental_id: rental.id,
-      type: 'info',
-      title: overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
-      message: overdueFee > 0
+    await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+    await orders.notifyUser(req.userId, rental.id, 'info',
+      overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
+      overdueFee > 0
         ? `${rental.tools.name} — штраф ${overdueFee.toLocaleString('ru-RU')} сум`
-        : `${rental.tools.name} — спасибо за использование Taketool!`
-    });
+        : `${rental.tools.name} — спасибо за использование Taketool!`);
 
     res.json({
-      rental: updated,
-      overdue_fee: overdueFee,
-      lock_opened: true,
+      rental: updated, overdue_fee: overdueFee, lock_opened: true,
       message: overdueFee > 0
         ? `Замок открыт. Штраф ${overdueFee} сум за просрочку`
-        : 'Замок открыт. Верните инструмент в ячейку. Спасибо!'
+        : 'Замок открыт. Верните инструмент в ячейку. Спасибо!',
     });
   } catch (err) {
     console.error('return error:', err);
     res.status(500).json({ error: 'Ошибка возврата' });
+  }
+});
+
+// POST /api/rentals/:id/return-courier — вызвать курьера за инструментом (платно).
+// body: { provider, delivery{ address, entrance, floor, apt, phone, comment, slot } }
+router.post('/:id/return-courier', async (req, res) => {
+  try {
+    const { data: rental, error: rErr } = await supabase
+      .from('rentals')
+      .select('*, tools(id, name, cell_id)')
+      .eq('id', req.params.id)
+      .eq('user_id', req.userId)
+      .single();
+    if (rErr || !rental) return res.status(404).json({ error: 'Аренда не найдена' });
+    if (rental.kind !== 'rent' || !['active', 'overdue'].includes(rental.status)) {
+      return res.status(400).json({ error: 'Курьера можно вызвать только по активной аренде' });
+    }
+    const { data: existing } = await supabase
+      .from('rentals').select('id').eq('parent_rental_id', rental.id)
+      .in('status', ['pending_payment', 'pending_delivery']).limit(1);
+    if (existing && existing.length) {
+      return res.status(400).json({ error: 'Вызов курьера уже оформлен' });
+    }
+
+    const { data: usr } = await supabase.from('users').select('phone').eq('id', req.userId).single();
+    const parsed = await parseDelivery(req.body || {}, usr?.phone);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const fee = (await orders.getDelivery()).fee || 0;
+    const provider = req.body?.provider === 'click' ? 'click' : 'payme';
+    const now = new Date();
+
+    const { data: child, error: cErr } = await supabase
+      .from('rentals')
+      .insert({
+        user_id: req.userId,
+        tool_id: rental.tool_id,
+        kind: 'courier_return',
+        fulfillment: 'delivery',
+        parent_rental_id: rental.id,
+        days: 0,
+        started_at: now.toISOString(),
+        expected_end: now.toISOString(),
+        status: 'pending_payment',
+        items_price: 0,
+        discount: 0,
+        delivery_fee: fee,
+        total_price: fee,
+        payment_provider: provider,
+        ...parsed.fields,
+      })
+      .select()
+      .single();
+    if (cErr) throw cErr;
+
+    return paymentResponse(res, child, rental.tools, provider, req.userId, 'Оплатите вызов курьера.');
+  } catch (err) {
+    console.error('return-courier error:', err);
+    res.status(500).json({ error: 'Ошибка вызова курьера' });
   }
 });
 

@@ -11,6 +11,8 @@ const lockRoutes = require('./routes/locks');
 const paymeRoutes = require('./routes/payme');
 const clickRoutes = require('./routes/click');
 const cronRoutes = require('./routes/cron');
+const settingsRoutes = require('./routes/settings');
+const adminRoutes = require('./routes/admin');
 const kerong = require('./lib/kerong');
 
 const app = express();
@@ -24,7 +26,7 @@ app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
     name: 'Taketool API',
-    version: '1.1.0',
+    version: '1.2.0',
     kerong: kerong.MOCK_MODE ? 'mock' : 'live'
   });
 });
@@ -45,6 +47,10 @@ app.use('/api/payme', paymeRoutes);
 app.use('/api/payments/click', clickRoutes);
 // Cron-задачи Vercel (защищены CRON_SECRET)
 app.use('/api/cron', cronRoutes);
+// Публичные настройки (тариф и интервалы доставки)
+app.use('/api/settings', settingsRoutes);
+// Админские переходы заказов (X-Admin-Secret)
+app.use('/api/admin', adminRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {

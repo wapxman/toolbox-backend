@@ -97,7 +97,8 @@ router.get('/:id/tools', async (req, res) => {
           box_id
         )
       `)
-      .eq('cells.box_id', req.params.id);
+      .eq('cells.box_id', req.params.id)
+      .eq('status', 'available');
 
     if (category) {
       query = query.eq('category', category);
@@ -116,6 +117,7 @@ router.get('/:id/tools', async (req, res) => {
       specs: tool.specs,
       photo_url: tool.photo_url,
       day_price: tool.day_price,
+      sale_price: tool.sale_price,
       condition: tool.condition,
       cell_number: tool.cells.cell_number,
       status: tool.cells.status

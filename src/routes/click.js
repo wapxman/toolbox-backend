@@ -8,7 +8,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const supabase = require('../lib/supabase');
-const kerong = require('../lib/kerong');
+const orders = require('../lib/orders');
 
 const router = express.Router();
 // Click шлёт application/x-www-form-urlencoded
@@ -175,49 +175,12 @@ router.post('/complete', async (req, res) => {
   await supabase.from('click_transactions')
     .update({ state: ST_CONFIRMED, confirm_time: confirmTime }).eq('id', tx.id);
 
-  const rental = await getRental(tx.merchant_trans_id);
-  const startedAt = new Date();
-  const expectedEnd = new Date(startedAt);
-  expectedEnd.setDate(expectedEnd.getDate() + (rental?.days || 1));
-  await supabase.from('rentals').update({
-    status: 'active',
-    started_at: startedAt.toISOString(),
-    expected_end: expectedEnd.toISOString(),
-  }).eq('id', tx.merchant_trans_id);
-
-  if (rental?.tools?.cell_id) {
-    await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
-  }
-
-  await supabase.from('transactions').insert({
-    rental_id: tx.merchant_trans_id,
-    user_id: rental?.user_id,
-    amount: Math.round(Number(tx.amount)),
-    type: 'payment',
-    payment_method: 'click',
-    payment_id: String(tx.click_trans_id),
-    status: 'success',
+  // Подтверждаем заказ: аренда/покупка, из бокса/с доставкой — вся логика в lib/orders
+  await orders.confirmPayment(tx.merchant_trans_id, {
+    method: 'click',
+    paymentId: String(tx.click_trans_id),
+    amountSum: Math.round(Number(tx.amount)),
   });
-
-  // Открываем замок (ошибка замка не должна ронять подтверждение оплаты)
-  try {
-    const cell = rental?.tools?.cells;
-    const zoneId = cell?.boxes?.kerong_zone_id || 1;
-    const lockNumber = cell?.kerong_lock_number ?? (cell?.cell_number != null ? cell.cell_number - 1 : null);
-    if (lockNumber != null) await kerong.openLock(zoneId, lockNumber);
-  } catch (e) {
-    console.error('click complete: lock open failed', e.message);
-  }
-
-  if (rental?.user_id) {
-    await supabase.from('notifications').insert({
-      user_id: rental.user_id,
-      rental_id: tx.merchant_trans_id,
-      type: 'payment',
-      title: 'Оплата прошла',
-      message: `Оплачено ${Math.round(Number(tx.amount)).toLocaleString('ru-RU')} сум через Click. Замок открыт — заберите инструмент!`,
-    });
-  }
 
   return res.json({
     click_trans_id: p.click_trans_id,

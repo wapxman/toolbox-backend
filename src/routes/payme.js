@@ -6,7 +6,7 @@
 
 const express = require('express');
 const supabase = require('../lib/supabase');
-const kerong = require('../lib/kerong');
+const orders = require('../lib/orders');
 
 const router = express.Router();
 
@@ -100,7 +100,10 @@ async function checkPerformTransaction(params) {
       detail: {
         receipt_type: 0,
         items: [{
-          title: `Аренда: ${rental.tools?.name || 'инструмент'} (${rental.days} дн.)`,
+          title: rental.kind === 'buy' ? `Покупка: ${rental.tools?.name || 'инструмент'}`
+            : rental.kind === 'courier_return' ? `Вызов курьера: ${rental.tools?.name || 'инструмент'}`
+            : `Аренда: ${rental.tools?.name || 'инструмент'} (${rental.days} дн.)`
+            + (rental.fulfillment === 'delivery' ? ' + доставка' : ''),
           price: rental.total_price * 100,
           count: 1,
           code: '10306002002000000', // ИКПУ из договора
@@ -169,56 +172,12 @@ async function performTransaction(params) {
     .update({ state: STATE_COMPLETED, perform_time: performTime })
     .eq('id', tx.id);
 
-  // Активируем аренду
-  const rental = await getRental(tx.rental_id);
-  const startedAt = new Date();
-  const expectedEnd = new Date(startedAt);
-  expectedEnd.setDate(expectedEnd.getDate() + (rental?.days || 1));
-
-  await supabase.from('rentals')
-    .update({
-      status: 'active',
-      started_at: startedAt.toISOString(),
-      expected_end: expectedEnd.toISOString(),
-    })
-    .eq('id', tx.rental_id);
-
-  // Помечаем ячейку занятой только теперь — после реальной оплаты.
-  if (rental?.tools?.cell_id) {
-    await supabase.from('cells')
-      .update({ status: 'occupied' })
-      .eq('id', rental.tools.cell_id);
-  }
-
-  await supabase.from('transactions').insert({
-    rental_id: tx.rental_id,
-    user_id: rental?.user_id,
-    amount: Math.round(Number(tx.amount) / 100),
-    type: 'payment',
-    payment_method: 'payme',
-    payment_id: tx.paycom_id,
-    status: 'success',
+  // Подтверждаем заказ: аренда/покупка, из бокса/с доставкой — вся логика в lib/orders
+  await orders.confirmPayment(tx.rental_id, {
+    method: 'payme',
+    paymentId: tx.paycom_id,
+    amountSum: Math.round(Number(tx.amount) / 100),
   });
-
-  // Открываем замок (ошибка замка не должна ронять подтверждение оплаты)
-  try {
-    const cell = rental?.tools?.cells;
-    const zoneId = cell?.boxes?.kerong_zone_id || 1;
-    const lockNumber = cell?.kerong_lock_number ?? (cell?.cell_number != null ? cell.cell_number - 1 : null);
-    if (lockNumber != null) await kerong.openLock(zoneId, lockNumber);
-  } catch (e) {
-    console.error('payme perform: lock open failed', e.message);
-  }
-
-  if (rental?.user_id) {
-    await supabase.from('notifications').insert({
-      user_id: rental.user_id,
-      rental_id: tx.rental_id,
-      type: 'payment',
-      title: 'Оплата прошла',
-      message: `Оплачено ${Math.round(Number(tx.amount) / 100).toLocaleString('ru-RU')} сум через Payme. Замок открыт — заберите инструмент!`,
-    });
-  }
 
   return { result: { transaction: tx.id, perform_time: performTime, state: STATE_COMPLETED } };
 }
@@ -242,8 +201,9 @@ async function cancelTransaction(params) {
   // не трогаем — отмена транзакции не должна переписывать её историю.
   const rental = await getRental(tx.rental_id);
   if (rental && rental.status !== 'completed') {
-    await supabase.from('rentals').update({ status: 'cancelled' }).eq('id', tx.rental_id);
-    if (rental?.tools?.cells) {
+    await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: new Date().toISOString() }).eq('id', tx.rental_id);
+    // Ячейку освобождаем только по самому заказу; вызов курьера (courier_return) ячейкой не владеет
+    if (rental?.tools?.cells && rental.kind !== 'courier_return') {
       await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
     }
   }
