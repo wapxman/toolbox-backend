@@ -54,7 +54,7 @@ async function getRental(rentalId) {
   if (!rentalId || !/^[0-9a-f-]{36}$/i.test(String(rentalId))) return null;
   const { data } = await supabase
     .from('rentals')
-    .select('*, tools(name, cell_id, cells(cell_number, kerong_lock_number, boxes(*)))')
+    .select('*, tools(name, cell_id, sale_stock, cells(cell_number, kerong_lock_number, boxes(*)))')
     .eq('id', rentalId)
     .single();
   return data || null;
@@ -93,6 +93,8 @@ async function checkPerformTransaction(params) {
   if (rental.status === 'cancelled') return { error: ERR.rentalCancelled };
   if (rental.status !== 'pending_payment') return { error: ERR.rentalPaid };
   if (Number(params.amount) !== rental.total_price * 100) return { error: ERR.wrongAmount };
+  // Покупка: нельзя принять оплату, если новых единиц на складе не осталось
+  if (rental.kind === 'buy' && !(Number(rental.tools?.sale_stock || 0) > 0)) return { error: ERR.cannotPerform };
 
   return {
     result: {
@@ -197,13 +199,19 @@ async function cancelTransaction(params) {
     .update({ state: newState, reason: Number(params.reason) || null, cancel_time: cancelTime })
     .eq('id', tx.id);
 
-  // Возвращаем аренду/ячейку. Завершённую аренду (инструмент уже возвращён)
-  // не трогаем — отмена транзакции не должна переписывать её историю.
+  // Отмена ДО оплаты — просто закрываем заказ. Отмена ПОСЛЕ оплаты (возврат средств
+  // со стороны Payme) — заказ отменён, деньги уже вернулись (refund done), склад/ячейка обратно.
+  // Завершённую аренду (инструмент уже возвращён) не трогаем.
   const rental = await getRental(tx.rental_id);
   if (rental && rental.status !== 'completed') {
-    await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: new Date().toISOString() }).eq('id', tx.rental_id);
+    const afterPay = newState === STATE_CANCELLED_AFTER;
+    await supabase.from('rentals').update({
+      status: 'cancelled', cancelled_at: new Date().toISOString(),
+      ...(afterPay ? { refund_status: 'done' } : {}),
+    }).eq('id', tx.rental_id);
+    if (afterPay && rental.kind === 'buy') await orders.returnStock(rental.tool_id);
     // Ячейку освобождаем только по самому заказу; вызов курьера (courier_return) ячейкой не владеет
-    if (rental?.tools?.cells && rental.kind !== 'courier_return') {
+    if (rental?.tools?.cells && rental.kind === 'rent') {
       await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
     }
   }

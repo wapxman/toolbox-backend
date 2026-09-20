@@ -2,15 +2,20 @@
 // Таблица rentals — это и есть заказы: kind = rent | buy | courier_return,
 // fulfillment = pickup (из бокса) | delivery (курьером по Ташкенту).
 //
-// Жизненный цикл:
-//   pending_payment → (оплата) →
-//     pickup+rent  → active (замок открыт)            → completed при возврате
-//     pickup+buy   → completed (замок открыт, tools.status = sold)
-//     delivery/*   → pending_delivery (delivery_status paid → packed → dispatched → delivered)
-//                    rent: delivered → active, срок идёт с момента передачи
-//                    buy:  delivered → completed, инструмент sold
-//     courier_return → pending_delivery → picked_up: родительская аренда completed
-//   cancelled — клиентом до dispatched или админом; возврат денег — вручную в кассе.
+// ПРОДАЖА — это НОВЫЕ единицы со склада (tools.sale_stock), а не арендный экземпляр
+// из ячейки. Остаток списывается в момент подтверждения оплаты, возвращается при отмене.
+//
+// Жизненный цикл (status / delivery_status):
+//   pending_payment ──(оплата)──►
+//     rent + pickup   : active                (замок открыт сразу)      → completed при возврате в бокс
+//     rent + delivery : pending_delivery/paid → packed → dispatched → delivered ⇒ active (срок с delivered_at)
+//     buy  + pickup   : pending_delivery/paid → ready (админ положил новую единицу в ячейку)
+//                       → клиент открывает ячейку из приложения ⇒ completed/delivered
+//     buy  + delivery : pending_delivery/paid → packed → dispatched → delivered ⇒ completed
+//     courier_return  : pending_delivery/paid → dispatched → picked_up ⇒ completed,
+//                       родительская аренда completed, restock_pending (инструмент вне бокса)
+//   cancelled — клиентом до dispatched/ready или админом; после оплаты refund_status = pending,
+//               админ возвращает деньги в кассе и ставит done.
 
 const supabase = require('./supabase');
 const kerong = require('./kerong');
@@ -26,6 +31,7 @@ const DEFAULT_DELIVERY = {
   same_day_min_hours: 2,
   days_ahead: 2,
 };
+const DEFAULT_SUPPORT = { phone: '+998935236060', telegram: null, email: 'support@taketool.uz' };
 const cache = {};
 async function getSetting(key, defaults) {
   const c = cache[key];
@@ -40,6 +46,7 @@ async function getSetting(key, defaults) {
 }
 const getPricing = () => getSetting('pricing', DEFAULT_PRICING);
 const getDelivery = () => getSetting('delivery', DEFAULT_DELIVERY);
+const getSupport = () => getSetting('support', DEFAULT_SUPPORT);
 
 function calculatePrice(dayPrice, days, pricing = DEFAULT_PRICING) {
   if (days >= 7) return Math.round(days * dayPrice * (1 - pricing.discount7_pct / 100));
@@ -47,15 +54,23 @@ function calculatePrice(dayPrice, days, pricing = DEFAULT_PRICING) {
   return days * dayPrice;
 }
 
+// Штраф за просрочку на текущий момент (0, если срок не вышел)
+async function overdueFeeFor(rental, at = new Date()) {
+  const expectedEnd = new Date(rental.expected_end);
+  if (at <= expectedEnd) return 0;
+  const { overdue_multiplier } = await getPricing();
+  const overdueDays = Math.ceil((at - expectedEnd) / 86_400_000);
+  const base = (rental.items_price != null ? rental.items_price - (rental.discount || 0) : rental.total_price);
+  return Math.round(overdueDays * (base / (rental.days || 1)) * overdue_multiplier);
+}
+
 // --- Интервалы доставки ---
-// Дата в Ташкенте (YYYY-MM-DD) со смещением дней
 function tashkentDate(offsetDays = 0) {
   const d = new Date(Date.now() + 5 * 3600_000 + offsetDays * 86_400_000);
   return d.toISOString().slice(0, 10);
 }
 function slotStart(date, hhmm) { return new Date(`${date}T${hhmm}:00${TZ_OFFSET}`); }
 
-// Список доступных интервалов на ближайшие дни для приложения
 async function availableSlots() {
   const s = await getDelivery();
   const out = [];
@@ -65,17 +80,12 @@ async function availableSlots() {
     for (const sl of s.slots || []) {
       const start = slotStart(date, sl.start);
       const available = start.getTime() - Date.now() >= (s.same_day_min_hours || 2) * 3600_000;
-      out.push({
-        date, start: sl.start, end: sl.end,
-        label: `${labels[i] || date}, ${sl.start}–${sl.end}`,
-        available,
-      });
+      out.push({ date, start: sl.start, end: sl.end, label: `${labels[i] || date}, ${sl.start}–${sl.end}`, available });
     }
   }
   return out;
 }
 
-// Валидация выбранного интервала; вернёт {start,end,label} либо {error}
 async function resolveSlot(slot) {
   if (!slot || !slot.date || !slot.start) return { error: 'Выберите интервал доставки' };
   const all = await availableSlots();
@@ -90,23 +100,26 @@ async function resolveSlot(slot) {
 }
 
 // --- Загрузка заказа с инструментом/ячейкой/боксом ---
+const RENTAL_FULL = '*, tools(id, name, cell_id, sale_stock, cells(cell_number, kerong_lock_number, boxes(*))), pickup_cell:cells!rentals_pickup_cell_id_fkey(id, cell_number, kerong_lock_number, boxes(*))';
 async function loadRental(id) {
   if (!id || !/^[0-9a-f-]{36}$/i.test(String(id))) return null;
-  const { data } = await supabase
-    .from('rentals')
-    .select('*, tools(id, name, cell_id, cells(cell_number, kerong_lock_number, boxes(*)))')
-    .eq('id', id)
-    .single();
+  const { data, error } = await supabase.from('rentals').select(RENTAL_FULL).eq('id', id).single();
+  if (error) console.error('loadRental', error.message);
   return data || null;
 }
 
-async function openCellFor(rental) {
-  const cell = rental?.tools?.cells;
+async function openLock(cell) {
   const zoneId = cell?.boxes?.kerong_zone_id || 1;
   const lockNumber = cell?.kerong_lock_number ?? (cell?.cell_number != null ? cell.cell_number - 1 : null);
   if (lockNumber == null) throw new Error('Нет номера замка');
   await kerong.openLock(zoneId, lockNumber);
 }
+// Ячейка заказа: для покупки с самовывозом — pickup_cell, иначе ячейка арендного экземпляра
+function cellOf(rental) {
+  if (rental.kind === 'buy') return rental.pickup_cell || null;
+  return rental.tools?.cells || null;
+}
+async function openCellFor(rental) { await openLock(cellOf(rental)); }
 
 async function notifyUser(userId, rentalId, type, title, message) {
   if (!userId) return;
@@ -115,14 +128,13 @@ async function notifyUser(userId, rentalId, type, title, message) {
   } catch (e) { console.error('notify user failed', e.message); }
 }
 
-// Telegram-уведомление операторам (env ADMIN_TG_TOKEN + ADMIN_TG_CHAT). Без env — тихо.
+// Telegram операторам (env ADMIN_TG_TOKEN + ADMIN_TG_CHAT). Без env — тихо.
 async function notifyAdmin(text) {
   const token = process.env.ADMIN_TG_TOKEN, chat = process.env.ADMIN_TG_CHAT;
   if (!token || !chat) return;
   try {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chat, text, parse_mode: 'HTML' }),
     });
   } catch (e) { console.error('notify admin failed', e.message); }
@@ -142,114 +154,151 @@ function addressLine(r) {
   return parts.filter(Boolean).join(', ');
 }
 
-// --- Подтверждение оплаты (вызывают Payme PerformTransaction и Click Complete) ---
+// --- Склад новых единиц ---
+// Списать одну единицу; вернёт true, если остаток был > 0.
+async function takeStock(toolId) {
+  const { data: t } = await supabase.from('tools').select('sale_stock').eq('id', toolId).single();
+  const stock = Number(t?.sale_stock || 0);
+  if (stock <= 0) return false;
+  const { data } = await supabase.from('tools').update({ sale_stock: stock - 1 })
+    .eq('id', toolId).eq('sale_stock', stock).select('id'); // optimistic lock
+  if (!data || !data.length) return takeStock(toolId);        // гонка — повторим
+  return true;
+}
+async function returnStock(toolId) {
+  const { data: t } = await supabase.from('tools').select('sale_stock').eq('id', toolId).single();
+  await supabase.from('tools').update({ sale_stock: Number(t?.sale_stock || 0) + 1 }).eq('id', toolId);
+}
+
+// --- Подтверждение оплаты (Payme PerformTransaction / Click Complete) ---
 async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
   const rental = await loadRental(rentalId);
   if (!rental) return null;
+  if (rental.status !== 'pending_payment') return rental; // идемпотентность: уже подтверждали
   const now = new Date();
+  const nowIso = now.toISOString();
 
   await supabase.from('transactions').insert({
-    rental_id: rentalId,
-    user_id: rental.user_id,
-    amount: Math.round(Number(amountSum)),
-    type: 'payment',
-    payment_method: method,
-    payment_id: String(paymentId),
-    status: 'success',
+    rental_id: rentalId, user_id: rental.user_id,
+    amount: Math.round(Number(amountSum)), type: 'payment',
+    payment_method: method, payment_id: String(paymentId), status: 'success',
   });
-
   const paidText = `Оплачено ${fmt(amountSum)} сум через ${method === 'click' ? 'Click' : 'Payme'}.`;
+  const name = rental.tools?.name || 'инструмент';
 
-  // 1) Вызов курьера для возврата арендованного инструмента
+  // 1) Вызов курьера за арендованным инструментом
   if (rental.kind === 'courier_return') {
-    await supabase.from('rentals').update({
-      status: 'pending_delivery', delivery_status: 'paid', paid_at: now.toISOString(),
-    }).eq('id', rentalId);
+    await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
     if (rental.parent_rental_id) {
       await supabase.from('rentals').update({ return_method: 'courier' }).eq('id', rental.parent_rental_id);
     }
     await notifyUser(rental.user_id, rentalId, 'payment', 'Курьер вызван',
-      `${paidText} Курьер заберёт инструмент: ${rental.delivery_slot_label || 'в выбранное время'}.`);
-    notifyAdmin(`🔁 <b>Возврат курьером</b> №${rental.order_number}\n${rental.tools?.name}\n${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}`);
+      `${paidText} Курьер заберёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`);
+    notifyAdmin(`🔁 <b>Возврат курьером</b> №${rental.order_number}\n${name}\n${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}`);
     return rental;
   }
 
-  // 2) Доставка (аренда или покупка): ждём курьера, ячейку резервируем
-  if (rental.fulfillment === 'delivery') {
-    await supabase.from('rentals').update({
-      status: 'pending_delivery', delivery_status: 'paid', paid_at: now.toISOString(),
-    }).eq('id', rentalId);
-    if (rental.tools?.cell_id) {
-      await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
-    }
-    await notifyUser(rental.user_id, rentalId, 'payment', 'Заказ оплачен',
-      `${paidText} Курьер привезёт ${rental.tools?.name}: ${rental.delivery_slot_label || 'в выбранное время'}.`);
-    notifyAdmin(`🚚 <b>Новый заказ с доставкой</b> №${rental.order_number}\n${describe(rental)}\n${fmt(rental.total_price)} сум\n${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}${rental.delivery_comment ? '\n💬 ' + rental.delivery_comment : ''}`);
-    return rental;
-  }
-
-  // 3) Покупка из бокса: ячейка открывается, инструмент продан
+  // 2) Покупка (новая единица со склада): списываем остаток, ждём сборки/выдачи
   if (rental.kind === 'buy') {
-    await supabase.from('rentals').update({
-      status: 'completed', paid_at: now.toISOString(), actual_end: now.toISOString(),
-      started_at: now.toISOString(), expected_end: now.toISOString(),
-      delivery_status: 'delivered', delivered_at: now.toISOString(),
-    }).eq('id', rentalId);
-    await supabase.from('tools').update({ status: 'sold' }).eq('id', rental.tool_id);
-    if (rental.tools?.cell_id) {
-      await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+    const ok = await takeStock(rental.tool_id);
+    await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
+    if (rental.fulfillment === 'delivery') {
+      await notifyUser(rental.user_id, rentalId, 'payment', 'Покупка оплачена',
+        `${paidText} Курьер привезёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`);
+    } else {
+      await notifyUser(rental.user_id, rentalId, 'payment', 'Покупка оплачена',
+        `${paidText} Мы положим новый ${name} в ячейку бокса и пришлём уведомление — тогда его можно будет забрать.`);
     }
-    try { await openCellFor(rental); } catch (e) { console.error('buy pickup: lock open failed', e.message); }
-    await notifyUser(rental.user_id, rentalId, 'payment', 'Покупка оплачена',
-      `${paidText} Ячейка ${rental.tools?.cells?.cell_number ?? ''} открыта — заберите ${rental.tools?.name}. Спасибо за покупку!`);
-    notifyAdmin(`🛒 <b>Покупка из бокса</b> №${rental.order_number}\n${rental.tools?.name} — ${fmt(rental.total_price)} сум`);
+    notifyAdmin(`🛒 <b>Покупка</b> №${rental.order_number} — ${name}, ${fmt(rental.total_price)} сум\n` +
+      (rental.fulfillment === 'delivery'
+        ? `🚚 ${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}`
+        : `📦 Самовывоз: положить новую единицу в свободную ячейку и нажать «Готов к выдаче»`) +
+      (ok ? '' : '\n⚠️ ОСТАТКА НА СКЛАДЕ НЕ БЫЛО — проверьте наличие'));
     return rental;
   }
 
-  // 4) Аренда из бокса — как раньше: активируем и открываем замок
+  // 3) Аренда с доставкой: ждём курьера, ячейку резервируем (экземпляр поедет клиенту)
+  if (rental.fulfillment === 'delivery') {
+    await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
+    if (rental.tools?.cell_id) await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
+    await notifyUser(rental.user_id, rentalId, 'payment', 'Заказ оплачен',
+      `${paidText} Курьер привезёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`);
+    notifyAdmin(`🚚 <b>Аренда с доставкой</b> №${rental.order_number}\n${describe(rental)}\n${fmt(rental.total_price)} сум\n${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}${rental.delivery_comment ? '\n💬 ' + rental.delivery_comment : ''}`);
+    return rental;
+  }
+
+  // 4) Аренда из бокса — активируем и открываем замок
   const expectedEnd = new Date(now);
   expectedEnd.setDate(expectedEnd.getDate() + (rental.days || 1));
   await supabase.from('rentals').update({
-    status: 'active', paid_at: now.toISOString(),
-    started_at: now.toISOString(), expected_end: expectedEnd.toISOString(),
+    status: 'active', paid_at: nowIso, started_at: nowIso, expected_end: expectedEnd.toISOString(),
   }).eq('id', rentalId);
-  if (rental.tools?.cell_id) {
-    await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
-  }
+  if (rental.tools?.cell_id) await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
   try { await openCellFor(rental); } catch (e) { console.error('rent pickup: lock open failed', e.message); }
-  await notifyUser(rental.user_id, rentalId, 'payment', 'Оплата прошла',
-    `${paidText} Замок открыт — заберите инструмент!`);
+  await notifyUser(rental.user_id, rentalId, 'payment', 'Оплата прошла', `${paidText} Замок открыт — заберите инструмент!`);
   return rental;
 }
 
-// Отмена неоплаченного/ещё не отправленного заказа. Возвращает {ok} или {error}.
+// Клиент забирает оплаченную покупку из ячейки (delivery_status = ready)
+async function pickupPurchase(rental) {
+  if (rental.kind !== 'buy' || rental.fulfillment !== 'pickup') return { error: 'Это не покупка с самовывозом' };
+  if (rental.status !== 'pending_delivery' || rental.delivery_status !== 'ready') {
+    return { error: 'Заказ ещё не готов к выдаче — дождитесь уведомления' };
+  }
+  try { await openCellFor(rental); } catch (e) {
+    return { error: 'Не удалось открыть ячейку. Попробуйте через минуту или напишите в поддержку.', lock_failed: true };
+  }
+  const nowIso = new Date().toISOString();
+  await supabase.from('rentals').update({
+    status: 'completed', delivery_status: 'delivered', delivered_at: nowIso, actual_end: nowIso,
+  }).eq('id', rental.id);
+  if (rental.pickup_cell_id) await supabase.from('cells').update({ status: 'free' }).eq('id', rental.pickup_cell_id);
+  await notifyUser(rental.user_id, rental.id, 'info', 'Покупка выдана', `${rental.tools?.name || 'Инструмент'} — спасибо за покупку!`);
+  return { ok: true, cell_number: rental.pickup_cell?.cell_number };
+}
+
+// Отмена заказа. Возвращает {ok, refund_required} или {error}.
 async function cancelOrder(rental, by = 'user') {
   if (!rental) return { error: 'Заказ не найден' };
   if (rental.status === 'cancelled') return { ok: true };
-  const paid = rental.status === 'pending_delivery';
+  const nowIso = new Date().toISOString();
+
   if (rental.status === 'pending_payment') {
-    await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: new Date().toISOString() }).eq('id', rental.id);
-    return { ok: true };
+    await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: nowIso }).eq('id', rental.id);
+    return { ok: true, refund_required: false };
   }
-  if (!paid) return { error: 'Этот заказ уже нельзя отменить' };
+  if (rental.status !== 'pending_delivery') return { error: 'Этот заказ уже нельзя отменить' };
   if (['dispatched', 'delivered', 'picked_up'].includes(rental.delivery_status)) {
     return { error: 'Курьер уже в пути — отмена невозможна, свяжитесь с поддержкой' };
   }
-  await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: new Date().toISOString() }).eq('id', rental.id);
-  if (rental.kind !== 'courier_return' && rental.tools?.cell_id) {
-    await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+  if (by === 'user' && rental.delivery_status === 'ready') {
+    return { error: 'Покупка уже лежит в ячейке — для отмены свяжитесь с поддержкой' };
   }
-  if (rental.kind === 'courier_return' && rental.parent_rental_id) {
+
+  // Инструмент физически вне полки/ячейки? — ждём, пока сотрудник вернёт его
+  const outOfPlace = rental.delivery_status === 'packed' || rental.delivery_status === 'ready';
+  await supabase.from('rentals').update({
+    status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending', restock_pending: outOfPlace,
+  }).eq('id', rental.id);
+
+  if (rental.kind === 'buy') {
+    if (!outOfPlace) await returnStock(rental.tool_id); // единица не тронута — сразу на склад
+    // ready: единица в ячейке, ячейка занята до «в боксе/на складе» (restocked)
+  } else if (rental.kind === 'rent') {
+    if (!outOfPlace && rental.tools?.cell_id) await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+  } else if (rental.kind === 'courier_return' && rental.parent_rental_id) {
     await supabase.from('rentals').update({ return_method: null }).eq('id', rental.parent_rental_id);
   }
+
   await notifyUser(rental.user_id, rental.id, 'info', 'Заказ отменён',
-    `Заказ №${rental.order_number} отменён. Деньги вернутся тем же способом оплаты в течение 1–3 дней.`);
-  notifyAdmin(`❌ <b>Отмена заказа</b> №${rental.order_number} (${by})\n${describe(rental)}\nНужен возврат ${fmt(rental.total_price)} сум в кассе ${rental.payment_provider}`);
+    `Заказ №${rental.order_number} отменён. Деньги (${fmt(rental.total_price)} сум) вернутся тем же способом оплаты в течение 1–3 рабочих дней.`);
+  notifyAdmin(`❌ <b>Отмена заказа</b> №${rental.order_number} (${by === 'user' ? 'клиент' : 'админ'})\n${describe(rental)}\n💸 Вернуть ${fmt(rental.total_price)} сум в кассе ${rental.payment_provider}${outOfPlace ? '\n📦 Инструмент вне места — вернуть в бокс/на склад' : ''}`);
   return { ok: true, refund_required: true };
 }
 
 module.exports = {
-  getPricing, getDelivery, calculatePrice, availableSlots, resolveSlot,
-  loadRental, openCellFor, notifyUser, notifyAdmin, confirmPayment, cancelOrder,
+  getPricing, getDelivery, getSupport, calculatePrice, overdueFeeFor, availableSlots, resolveSlot,
+  RENTAL_FULL, loadRental, openLock, cellOf, openCellFor, notifyUser, notifyAdmin,
+  takeStock, returnStock, confirmPayment, pickupPurchase, cancelOrder,
   describe, addressLine, fmt,
 };

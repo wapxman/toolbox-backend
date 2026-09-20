@@ -118,6 +118,7 @@ router.get('/:id/tools', async (req, res) => {
       photo_url: tool.photo_url,
       day_price: tool.day_price,
       sale_price: tool.sale_price,
+      sale_stock: Number(tool.sale_stock || 0),
       condition: tool.condition,
       cell_number: tool.cells.cell_number,
       status: tool.cells.status

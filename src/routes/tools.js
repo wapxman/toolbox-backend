@@ -10,6 +10,7 @@ async function busyUntilMap(toolIds) {
     .from('rentals')
     .select('tool_id, expected_end, status')
     .in('tool_id', toolIds)
+    .eq('kind', 'rent') // покупки — новые единицы со склада, арендный экземпляр не занимают
     .in('status', ['active', 'overdue', 'pending_delivery']);
   const map = {};
   for (const r of data || []) {
@@ -31,6 +32,7 @@ function publicTool(tool, busy) {
     photo_url: tool.photo_url,
     day_price: tool.day_price,
     sale_price: tool.sale_price,
+    sale_stock: Number(tool.sale_stock || 0),
     sale_condition: tool.sale_condition,
     sale_kit: tool.sale_kit,
     sale_warranty: tool.sale_warranty,
@@ -54,7 +56,7 @@ router.get('/', async (req, res) => {
       .eq('status', 'available')
       .order('name');
     if (category) query = query.eq('category', String(category));
-    if (mode === 'buy') query = query.not('sale_price', 'is', null).gt('sale_price', 0);
+    if (mode === 'buy') query = query.not('sale_price', 'is', null).gt('sale_price', 0).gt('sale_stock', 0);
     if (q && String(q).trim().length >= 2) {
       const safeQ = String(q).replace(/[,()]/g, ' ').trim();
       query = query.or(`name.ilike.%${safeQ}%,category.ilike.%${safeQ}%,brand.ilike.%${safeQ}%`);

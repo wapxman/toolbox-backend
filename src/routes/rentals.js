@@ -14,9 +14,10 @@ const ACTIVE_STATUSES = ['active', 'overdue', 'pending_delivery'];
 const RENTAL_SELECT = `
   *,
   tools (
-    id, name, category, brand, photo_url, day_price, sale_price,
+    id, name, category, brand, photo_url, day_price, sale_price, sale_stock,
     cells ( cell_number, qr_code, boxes ( id, name, address ) )
-  )
+  ),
+  pickup_cell:cells!rentals_pickup_cell_id_fkey ( id, cell_number, boxes ( id, name, address ) )
 `;
 
 // Собираем ответ с платёжной ссылкой (Payme — checkout, Click — счёт в Click Up + ссылка)
@@ -109,9 +110,15 @@ router.post('/', async (req, res) => {
     if (tool.status && tool.status !== 'available') {
       return res.status(400).json({ error: 'Инструмент больше не доступен' });
     }
-    if (tool.cells?.status !== 'free') return res.status(400).json({ error: 'Инструмент уже занят' });
+    if (kind === 'rent' && tool.cells?.status !== 'free') {
+      return res.status(400).json({ error: 'Инструмент уже занят' });
+    }
+    // Покупка — новая единица со склада: арендный экземпляр может быть занят, важен остаток
     if (kind === 'buy' && !(tool.sale_price > 0)) {
       return res.status(400).json({ error: 'Этот инструмент не продаётся' });
+    }
+    if (kind === 'buy' && !(Number(tool.sale_stock || 0) > 0)) {
+      return res.status(400).json({ error: 'Нет в наличии — остаток на складе закончился' });
     }
 
     // Цена
@@ -156,7 +163,7 @@ router.post('/', async (req, res) => {
       .single();
     if (rentalErr) throw rentalErr;
 
-    // Ячейку НЕ резервируем до оплаты (см. orders.confirmPayment).
+    // Ячейку/остаток НЕ резервируем до оплаты (см. orders.confirmPayment).
     return paymentResponse(res, rental, tool, provider, req.userId,
       kind === 'buy' ? 'Заказ создан. Оплатите покупку.' : 'Аренда создана. Оплатите, чтобы открыть замок.');
   } catch (err) {
@@ -284,6 +291,20 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// POST /api/rentals/:id/pickup — покупка с самовывозом: открыть ячейку с готовым заказом
+router.post('/:id/pickup', async (req, res) => {
+  try {
+    const rental = await orders.loadRental(req.params.id);
+    if (!rental || rental.user_id !== req.userId) return res.status(404).json({ error: 'Заказ не найден' });
+    const r = await orders.pickupPurchase(rental);
+    if (r.error) return res.status(r.lock_failed ? 503 : 400).json({ error: r.error, lock_failed: !!r.lock_failed });
+    res.json({ ok: true, cell_number: r.cell_number, message: `Ячейка ${r.cell_number ?? ''} открыта — заберите покупку. Спасибо!` });
+  } catch (err) {
+    console.error('pickup error:', err);
+    res.status(500).json({ error: 'Ошибка выдачи' });
+  }
+});
+
 // POST /api/rentals/:id/cancel — отмена клиентом (до передачи курьеру)
 router.post('/:id/cancel', async (req, res) => {
   try {
@@ -376,13 +397,7 @@ router.post('/:id/return', async (req, res) => {
     }
 
     const now = new Date();
-    const expectedEnd = new Date(rental.expected_end);
-    let overdueFee = 0;
-    if (now > expectedEnd) {
-      const { overdue_multiplier } = await getPricing();
-      const overdueDays = Math.ceil((now - expectedEnd) / 86_400_000);
-      overdueFee = Math.round(overdueDays * (rental.total_price / rental.days) * overdue_multiplier);
-    }
+    const overdueFee = await orders.overdueFeeFor(rental, now);
 
     const { data: updated, error: uErr } = await supabase
       .from('rentals')

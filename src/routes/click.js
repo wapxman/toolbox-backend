@@ -157,7 +157,8 @@ router.post('/complete', async (req, res) => {
   if (Number(p.error) < 0) {
     await supabase.from('click_transactions')
       .update({ state: ST_CANCELLED, cancel_time: Date.now() }).eq('id', tx.id);
-    await supabase.from('rentals').update({ status: 'cancelled' }).eq('id', tx.merchant_trans_id);
+    await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
+      .eq('id', tx.merchant_trans_id).eq('status', 'pending_payment');
     return res.json({ ...base, merchant_confirm_id: tx.prepare_id, error: Number(p.error), error_note: 'Cancelled by Click' });
   }
   if (Math.round(Number(p.amount)) !== Math.round(Number(tx.amount))) {
