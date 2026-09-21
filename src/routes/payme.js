@@ -77,9 +77,10 @@ async function expireIfNeeded(tx) {
       .update({ state: STATE_CANCELLED, reason: 4, cancel_time: cancelTime })
       .eq('id', tx.id);
     await supabase.from('rentals')
-      .update({ status: 'cancelled' })
+      .update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
       .eq('id', tx.rental_id)
-      .eq('status', 'pending_payment');
+      .eq('status', 'pending_payment')
+      .neq('kind', 'penalty'); // штраф не аннулируется по таймауту транзакции
     return { ...tx, state: STATE_CANCELLED, reason: 4, cancel_time: cancelTime };
   }
   return tx;
@@ -102,7 +103,8 @@ async function checkPerformTransaction(params) {
       detail: {
         receipt_type: 0,
         items: [{
-          title: rental.kind === 'buy' ? `Покупка: ${rental.tools?.name || 'инструмент'}`
+          title: rental.kind === 'penalty' ? `Штраф за просрочку аренды: ${rental.tools?.name || 'инструмент'}`
+            : rental.kind === 'buy' ? `Покупка: ${rental.tools?.name || 'инструмент'}`
             : rental.kind === 'courier_return' ? `Вызов курьера: ${rental.tools?.name || 'инструмент'}`
             : `Аренда: ${rental.tools?.name || 'инструмент'} (${rental.days} дн.)`
             + (rental.fulfillment === 'delivery' ? ' + доставка' : ''),
@@ -203,7 +205,8 @@ async function cancelTransaction(params) {
   // со стороны Payme) — заказ отменён, деньги уже вернулись (refund done), склад/ячейка обратно.
   // Завершённую аренду (инструмент уже возвращён) не трогаем.
   const rental = await getRental(tx.rental_id);
-  if (rental && rental.status !== 'completed') {
+  // Штраф: отмена НЕоплаченной транзакции счёт не закрывает (клиент попробует снова)
+  if (rental && rental.status !== 'completed' && !(rental.kind === 'penalty' && newState === STATE_CANCELLED)) {
     const afterPay = newState === STATE_CANCELLED_AFTER;
     await supabase.from('rentals').update({
       status: 'cancelled', cancelled_at: new Date().toISOString(),

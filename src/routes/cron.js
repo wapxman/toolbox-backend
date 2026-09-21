@@ -61,6 +61,7 @@ router.get('/overdue', async (req, res) => {
       .from('rentals')
       .update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
       .eq('status', 'pending_payment')
+      .neq('kind', 'penalty') // счёт за штраф живёт до оплаты
       .lt('created_at', dayAgo)
       .select('id');
 

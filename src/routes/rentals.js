@@ -89,6 +89,24 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Укажите количество дней (1-30)' });
     }
 
+    // Согласие с офертой: чекбокс в приложении обязателен, редакция — только действующая
+    const terms = await orders.getTerms();
+    if (String(body.terms_version || '') !== String(terms.version)) {
+      return res.status(400).json({ error: 'Подтвердите согласие с действующей редакцией оферты', terms });
+    }
+
+    // Неоплаченный штраф за просрочку блокирует новые аренды (п. 4 оферты)
+    if (kind === 'rent') {
+      const pens = await orders.unpaidPenalties(req.userId);
+      if (pens.length) {
+        const sum = pens.reduce((a, p) => a + (p.total_price || 0), 0);
+        return res.status(402).json({
+          error: `У вас неоплаченный штраф за просрочку: ${orders.fmt(sum)} сум. Оплатите его в разделе «Заказы», после этого аренда снова доступна.`,
+          penalty_id: pens[0].id, penalty_total: sum,
+        });
+      }
+    }
+
     if (kind === 'rent') {
       const { count: activeCount } = await supabase
         .from('rentals')
@@ -157,11 +175,22 @@ router.post('/', async (req, res) => {
         delivery_fee: deliveryFee,
         total_price: totalPrice,
         payment_provider: provider,
+        terms_version: String(terms.version),
         ...deliveryFields,
       })
       .select()
       .single();
     if (rentalErr) throw rentalErr;
+
+    // Журнал согласий: кто, когда, какая редакция, по какому заказу
+    await supabase.from('consents').insert({
+      user_id: req.userId, rental_id: rental.id, terms_version: String(terms.version),
+      terms_date: terms.date || null, terms_url: terms.url || null,
+      ip: (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim().slice(0, 64),
+      user_agent: (req.headers['user-agent'] || '').toString().slice(0, 200),
+      app_version: (req.headers['x-app-version'] || '').toString().slice(0, 32) || null,
+    });
+    await supabase.from('users').update({ terms_accepted_at: new Date().toISOString() }).eq('id', req.userId);
 
     // Ячейку/остаток НЕ резервируем до оплаты (см. orders.confirmPayment).
     return paymentResponse(res, rental, tool, provider, req.userId,
@@ -235,7 +264,7 @@ router.get('/active', async (req, res) => {
       .from('rentals')
       .select(RENTAL_SELECT)
       .eq('user_id', req.userId)
-      .in('status', ACTIVE_STATUSES)
+      .or(`status.in.(${ACTIVE_STATUSES.join(',')}),and(kind.eq.penalty,status.eq.pending_payment)`)
       .neq('kind', 'courier_return')
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -288,6 +317,26 @@ router.get('/:id', async (req, res) => {
   } catch (err) {
     console.error('rental detail error:', err);
     res.status(500).json({ error: 'Ошибка' });
+  }
+});
+
+// POST /api/rentals/:id/pay — оплатить существующий неоплаченный заказ (штраф, повторная попытка).
+// body: { provider } — можно сменить кассу.
+router.post('/:id/pay', async (req, res) => {
+  try {
+    const rental = await orders.loadRental(req.params.id);
+    if (!rental || rental.user_id !== req.userId) return res.status(404).json({ error: 'Заказ не найден' });
+    if (rental.status !== 'pending_payment') return res.status(400).json({ error: 'Заказ уже оплачен или отменён' });
+    const provider = req.body?.provider === 'click' ? 'click' : (req.body?.provider === 'payme' ? 'payme' : rental.payment_provider);
+    if (provider !== rental.payment_provider) {
+      await supabase.from('rentals').update({ payment_provider: provider }).eq('id', rental.id);
+      rental.payment_provider = provider;
+    }
+    return paymentResponse(res, rental, rental.tools, provider, req.userId,
+      rental.kind === 'penalty' ? 'Оплатите штраф за просрочку.' : 'Оплатите заказ.');
+  } catch (err) {
+    console.error('pay error:', err);
+    res.status(500).json({ error: 'Ошибка оплаты' });
   }
 });
 
@@ -408,16 +457,18 @@ router.post('/:id/return', async (req, res) => {
     if (uErr) throw uErr;
 
     await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+    const penalty = overdueFee > 0 ? await orders.createPenalty({ ...rental, order_number: updated.order_number }, overdueFee) : null;
     await orders.notifyUser(req.userId, rental.id, 'info',
       overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
       overdueFee > 0
-        ? `${rental.tools.name} — штраф ${overdueFee.toLocaleString('ru-RU')} сум`
+        ? `${rental.tools.name} — штраф ${overdueFee.toLocaleString('ru-RU')} сум, счёт выставлен`
         : `${rental.tools.name} — спасибо за использование Taketool!`);
 
     res.json({
       rental: updated, overdue_fee: overdueFee, lock_opened: true,
+      penalty_id: penalty?.id || null, penalty_order_number: penalty?.order_number || null,
       message: overdueFee > 0
-        ? `Замок открыт. Штраф ${overdueFee} сум за просрочку`
+        ? `Замок открыт. За просрочку выставлен счёт ${overdueFee.toLocaleString('ru-RU')} сум — оплатите его в разделе «Заказы».`
         : 'Замок открыт. Верните инструмент в ячейку. Спасибо!',
     });
   } catch (err) {

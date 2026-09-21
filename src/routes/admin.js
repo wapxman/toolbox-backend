@@ -108,6 +108,7 @@ router.patch('/orders/:id', async (req, res) => {
           await supabase.from('rentals').update({
             status: 'completed', actual_end: now, overdue_fee: overdueFee, return_method: 'courier', restock_pending: true,
           }).eq('id', parent.id);
+          if (overdueFee > 0) await orders.createPenalty(parent, overdueFee);
         }
         await orders.notifyUser(rental.user_id, rental.parent_rental_id || rental.id, 'info',
           overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
@@ -137,6 +138,13 @@ router.patch('/orders/:id', async (req, res) => {
         return res.json({ ok: true });
       }
 
+      // Аннулировать неоплаченный штраф (решение админа)
+      case 'waive_penalty': {
+        if (rental.kind !== 'penalty' || rental.status !== 'pending_payment') return res.status(400).json({ error: 'Это не неоплаченный штраф' });
+        const r = await orders.cancelOrder(rental, 'admin');
+        if (r.error) return res.status(400).json({ error: r.error });
+        return res.json(r);
+      }
       case 'cancel': {
         const r = await orders.cancelOrder(rental, 'admin');
         if (r.error) return res.status(400).json({ error: r.error });

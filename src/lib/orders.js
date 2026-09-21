@@ -32,6 +32,7 @@ const DEFAULT_DELIVERY = {
   days_ahead: 2,
 };
 const DEFAULT_SUPPORT = { phone: '+998935236060', telegram: null, email: 'support@taketool.uz' };
+const DEFAULT_TERMS = { version: '2026-09-21', date: '2026-09-21', url: 'https://www.taketool.uz/terms.html', title: 'Пользовательское соглашение (публичная оферта)' };
 const cache = {};
 async function getSetting(key, defaults) {
   const c = cache[key];
@@ -47,6 +48,7 @@ async function getSetting(key, defaults) {
 const getPricing = () => getSetting('pricing', DEFAULT_PRICING);
 const getDelivery = () => getSetting('delivery', DEFAULT_DELIVERY);
 const getSupport = () => getSetting('support', DEFAULT_SUPPORT);
+const getTerms = () => getSetting('terms', DEFAULT_TERMS);
 
 function calculatePrice(dayPrice, days, pricing = DEFAULT_PRICING) {
   if (days >= 7) return Math.round(days * dayPrice * (1 - pricing.discount7_pct / 100));
@@ -97,6 +99,37 @@ async function resolveSlot(slot) {
     end: slotStart(found.date, found.end).toISOString(),
     label: found.label,
   };
+}
+
+// --- Штраф за просрочку: отдельный счёт (kind = penalty) ---
+// Создаётся при возврате просроченной аренды. Аренда закрывается по факту возврата,
+// счёт висит pending_payment, пока клиент не оплатит. Неоплаченный штраф блокирует новые аренды.
+async function createPenalty(rental, fee, provider = 'payme') {
+  if (!(fee > 0)) return null;
+  const { data: existing } = await supabase.from('rentals').select('id')
+    .eq('parent_rental_id', rental.id).eq('kind', 'penalty').limit(1);
+  if (existing && existing.length) return existing[0];
+  const now = new Date().toISOString();
+  const { data: pen, error } = await supabase.from('rentals').insert({
+    user_id: rental.user_id, tool_id: rental.tool_id, kind: 'penalty', fulfillment: 'pickup',
+    parent_rental_id: rental.id, days: 0, started_at: now, expected_end: now,
+    status: 'pending_payment', items_price: fee, discount: 0, delivery_fee: 0, total_price: fee,
+    payment_provider: provider === 'click' ? 'click' : 'payme',
+  }).select().single();
+  if (error) { console.error('createPenalty', error.message); return null; }
+  await notifyUser(rental.user_id, pen.id, 'overdue', 'Счёт за просрочку',
+    `По аренде №${rental.order_number} начислен штраф ${fmt(fee)} сум (п. 4 оферты). Оплатите его в разделе «Заказы» — до оплаты новые аренды недоступны.`);
+  notifyAdmin(`⚠️ <b>Штраф за просрочку</b> №${pen.order_number} — ${fmt(fee)} сум по аренде №${rental.order_number} (${rental.tools?.name || ''})`);
+  return pen;
+}
+
+// Неоплаченные штрафы пользователя (для блокировки новых аренд)
+async function unpaidPenalties(userId) {
+  const { data } = await supabase.from('rentals')
+    .select('id, order_number, total_price, parent_rental_id, created_at')
+    .eq('user_id', userId).eq('kind', 'penalty').eq('status', 'pending_payment')
+    .order('created_at', { ascending: true });
+  return data || [];
 }
 
 // --- Загрузка заказа с инструментом/ячейкой/боксом ---
@@ -186,6 +219,14 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
   const paidText = `Оплачено ${fmt(amountSum)} сум через ${method === 'click' ? 'Click' : 'Payme'}.`;
   const name = rental.tools?.name || 'инструмент';
 
+  // 0) Оплата штрафа за просрочку: счёт закрыт, блокировка снята
+  if (rental.kind === 'penalty') {
+    await supabase.from('rentals').update({ status: 'completed', paid_at: nowIso, actual_end: nowIso }).eq('id', rentalId);
+    await notifyUser(rental.user_id, rentalId, 'payment', 'Штраф оплачен',
+      `${paidText} Спасибо — новые аренды снова доступны.`);
+    return rental;
+  }
+
   // 1) Вызов курьера за арендованным инструментом
   if (rental.kind === 'courier_return') {
     await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
@@ -264,7 +305,11 @@ async function cancelOrder(rental, by = 'user') {
   const nowIso = new Date().toISOString();
 
   if (rental.status === 'pending_payment') {
+    if (rental.kind === 'penalty' && by === 'user') return { error: 'Штраф отменить нельзя. По вопросам — в поддержку.' };
     await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: nowIso }).eq('id', rental.id);
+    if (rental.kind === 'penalty') {
+      await notifyUser(rental.user_id, rental.id, 'info', 'Штраф списан', `Счёт №${rental.order_number} аннулирован администратором.`);
+    }
     return { ok: true, refund_required: false };
   }
   if (rental.status !== 'pending_delivery') return { error: 'Этот заказ уже нельзя отменить' };
@@ -297,7 +342,8 @@ async function cancelOrder(rental, by = 'user') {
 }
 
 module.exports = {
-  getPricing, getDelivery, getSupport, calculatePrice, overdueFeeFor, availableSlots, resolveSlot,
+  getPricing, getDelivery, getSupport, getTerms, calculatePrice, overdueFeeFor, availableSlots, resolveSlot,
+  createPenalty, unpaidPenalties,
   RENTAL_FULL, loadRental, openLock, cellOf, openCellFor, notifyUser, notifyAdmin,
   takeStock, returnStock, confirmPayment, pickupPurchase, cancelOrder,
   describe, addressLine, fmt,

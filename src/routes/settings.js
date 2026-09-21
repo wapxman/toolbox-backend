@@ -25,4 +25,14 @@ router.get('/support', async (req, res) => {
   }
 });
 
+// GET /api/settings/terms — действующая редакция оферты (версия, дата, ссылка)
+router.get('/terms', async (req, res) => {
+  try {
+    const t = await orders.getTerms();
+    res.json({ version: String(t.version), date: t.date, url: t.url, title: t.title });
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка настроек оферты' });
+  }
+});
+
 module.exports = router;
