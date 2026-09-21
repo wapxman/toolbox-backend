@@ -260,11 +260,13 @@ router.delete('/me', auth, async (req, res) => {
       .from('rentals')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', req.userId)
-      .in('status', ['active', 'overdue', 'pending_payment']);
+      .in('status', ['active', 'overdue', 'pending_payment', 'pending_delivery']);
 
+    // Неоплаченный штраф — тоже pending_payment (kind=penalty): п. 10.1 оферты —
+    // удаление после закрытия аренд и оплаты выставленных счетов.
     if (openRentals && openRentals > 0) {
       return res.status(409).json({
-        error: 'Сначала верните инструмент и закройте активные аренды, затем удалите аккаунт'
+        error: 'Сначала закройте активные аренды и заказы и оплатите выставленные счета, затем удалите аккаунт'
       });
     }
 
