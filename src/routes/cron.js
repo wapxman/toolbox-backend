@@ -5,6 +5,7 @@
 const express = require('express');
 const supabase = require('../lib/supabase');
 const orders = require('../lib/orders');
+const { refreshSmsStatuses } = require('../lib/sms');
 
 const router = express.Router();
 
@@ -65,8 +66,17 @@ router.get('/overdue', async (req, res) => {
       .lt('created_at', dayAgo)
       .select('id');
 
-    console.log(`[CRON overdue] помечено: ${marked}, брошенных отменено: ${(stale || []).length}, ячеек исправлено: ${fixedCells.length}`);
-    res.json({ ok: true, marked, stale_cancelled: (stale || []).length, cells_fixed: fixedCells });
+    // 4) Статусы SMS. Eskiz при отправке отвечает «waiting»; доставлено или
+    //    отбито оператором — выясняется позже. Сбой сверки не должен ронять крон.
+    let sms = { updated: 0 };
+    try {
+      sms = await refreshSmsStatuses(3);
+    } catch (e) {
+      console.error('sms status refresh failed:', e.message);
+    }
+
+    console.log(`[CRON overdue] помечено: ${marked}, брошенных отменено: ${(stale || []).length}, ячеек исправлено: ${fixedCells.length}, статусов SMS обновлено: ${sms.updated}`);
+    res.json({ ok: true, marked, stale_cancelled: (stale || []).length, cells_fixed: fixedCells, sms_statuses_updated: sms.updated });
   } catch (err) {
     console.error('cron overdue error:', err);
     res.status(500).json({ error: 'cron failed' });
