@@ -20,6 +20,7 @@
 // PerformTransaction дважды, не приведёт к двойному сообщению в группе.
 
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const supabase = require('./supabase');
 
 const MAX_ATTEMPTS = 6;
@@ -54,11 +55,66 @@ const html = (strings, ...vals) =>
 // теряется), доставка честно падает, а состояние видно в GET /health.
 function configReport() {
   const missing = ['ADMIN_TG_TOKEN', 'ADMIN_TG_CHAT'].filter((k) => !process.env[k]);
-  return { telegram: missing.length ? 'misconfigured' : 'configured', missing };
+  return {
+    telegram: missing.length ? 'misconfigured' : 'configured',
+    missing,
+    // disabled — пушей просто ещё нет (это не авария);
+    // broken — переменная задана, но прочитать её не удалось, вот это уже авария.
+    push: fcmCredentials() ? 'configured' : (process.env.FCM_SERVICE_ACCOUNT ? 'broken' : 'disabled'),
+  };
 }
 
 if (configReport().missing.length) {
   console.warn('[outbox] Telegram операторам ОТКЛЮЧЁН: нет env', configReport().missing.join(', '));
+}
+
+// --- FCM: доступ -----------------------------------------------------------
+// Ключ сервис-аккаунта Firebase. В env Vercel храним base64: в исходном JSON
+// private_key содержит \n, которые легко испортить при копировании через веб-форму.
+// Принимаем и сырой JSON — на случай локальной отладки.
+function fcmCredentials() {
+  const raw = process.env.FCM_SERVICE_ACCOUNT;
+  if (!raw) return null;
+  try {
+    const text = raw.trim().startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+    const j = JSON.parse(text);
+    if (!j.client_email || !j.private_key || !j.project_id) return null;
+    return j;
+  } catch {
+    return null;
+  }
+}
+
+// FCM HTTP v1 требует OAuth-токен. Берём его по flow «JWT bearer»: подписываем
+// ассершн приватным ключом сервис-аккаунта и меняем на access_token. Токен живёт
+// час — держим в памяти процесса, чтобы не ходить за ним на каждое уведомление.
+let fcmAccess = null;
+async function fcmAccessToken(creds) {
+  if (fcmAccess && fcmAccess.expiresAt - Date.now() > 60_000) return fcmAccess.value;
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = jwt.sign({
+    iss: creds.client_email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  }, creds.private_key, { algorithm: 'RS256' });
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.access_token) {
+    throw new Error(`fcm oauth ${res.status}: ${JSON.stringify(j).slice(0, 200)}`);
+  }
+  fcmAccess = { value: j.access_token, expiresAt: Date.now() + (j.expires_in || 3600) * 1000 };
+  return fcmAccess.value;
 }
 
 // --- Ошибки ---------------------------------------------------------------
@@ -94,6 +150,61 @@ const channels = {
     if (res.status === 429 || res.status >= 500) throw new Error(`telegram ${res.status}: ${body}`);
     // 400 (битая разметка), 403 (бота выгнали) — повтор не поможет.
     throw new PermanentError(`telegram ${res.status}: ${body}`);
+  },
+
+  // Клиенту — пушем на телефон, на все его устройства.
+  async push(payload) {
+    const creds = fcmCredentials();
+    if (!creds) throw new Error('нет FCM_SERVICE_ACCOUNT');
+
+    const { data: devices, error } = await supabase
+      .from('device_tokens').select('token, platform').eq('user_id', payload.user_id);
+    if (error) throw new Error(`device_tokens: ${error.message}`);
+    // Телефонов не зарегистрировано — доставлять некуда, это не ошибка.
+    if (!devices?.length) return;
+
+    const access = await fcmAccessToken(creds);
+    const url = `https://fcm.googleapis.com/v1/projects/${creds.project_id}/messages:send`;
+    let delivered = 0;
+    const stale = [];
+    const errors = [];
+
+    for (const d of devices) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: {
+            token: d.token,
+            notification: { title: payload.title, body: payload.message },
+            // Данные — чтобы приложение по тапу открыло нужный заказ.
+            data: {
+              type: String(payload.type || 'info'),
+              rental_id: String(payload.rental_id || ''),
+            },
+            android: { priority: 'high', notification: { channel_id: 'taketool_orders' } },
+            apns: { payload: { aps: { sound: 'default' } } },
+          },
+        }),
+        signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      });
+      if (res.ok) { delivered++; continue; }
+
+      const body = await res.text().catch(() => '');
+      // Токен мёртв: приложение удалили или переустановили. Чистим — иначе он
+      // вечно отнимал бы попытки и ронял доставку на живые устройства.
+      if (res.status === 404 || (res.status === 400 && /registration token|INVALID_ARGUMENT|not a valid FCM/i.test(body))) {
+        stale.push(d.token);
+        continue;
+      }
+      errors.push(`${d.platform} ${res.status}: ${body.slice(0, 120)}`);
+    }
+
+    if (stale.length) await supabase.from('device_tokens').delete().in('token', stale);
+    // Дошло хоть куда-то, либо все токены оказались мёртвыми и вычищены — считаем
+    // доставленным. Повторять есть смысл только если живые устройства не ответили.
+    if (delivered || !errors.length) return;
+    throw new Error(errors.join(' | '));
   },
 
   // Клиенту — в «колокольчик» приложения.
@@ -201,12 +312,19 @@ async function flush() {
 async function notifyUser(userId, rentalId, type, title, message, opts = {}) {
   if (!userId) return { skipped: 'нет user_id' };
   const event = opts.event || `user.${type}`;
-  const r = await enqueue({
-    channel: 'in_app',
-    event,
-    dedupeKey: opts.dedupeKey || `${event}:${crypto.randomUUID()}`,
-    payload: { user_id: userId, rental_id: rentalId, type, title, message },
-  });
+  const base = opts.dedupeKey || `${event}:${crypto.randomUUID()}`;
+  const payload = { user_id: userId, rental_id: rentalId, type, title, message };
+
+  const r = await enqueue({ channel: 'in_app', event, dedupeKey: base, payload });
+
+  // Пуш на телефон — ОТДЕЛЬНОЙ строкой: свои повторы и свой исход, падение
+  // Firebase не должно мешать «колокольчику». Ставим в очередь только когда FCM
+  // настроен: иначе каждое уведомление плодило бы строку, которая шесть часов
+  // ходит по повторам и умирает, а /health из-за этого вечно кричал бы.
+  if (opts.push !== false && fcmCredentials()) {
+    await enqueue({ channel: 'push', event, dedupeKey: `${base}#push`, payload });
+  }
+
   await flush();
   return r;
 }

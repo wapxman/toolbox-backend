@@ -163,6 +163,88 @@ async function main() {
   check('возраст очереди посчитан', typeof st.oldest_queued_age_min === 'number');
   console.log('   ', JSON.stringify(st));
 
+  // --- 9. Канал push (FCM) --------------------------------------------------
+  // Без боевого ключа Firebase проверяем всё, кроме факта доставки Google:
+  // разбор ключа, состояния конфигурации, ветку «устройств нет» и то, что
+  // недостижимый FCM оставляет строку в очереди, а не теряет её.
+  console.log('\n9. Канал push (FCM)');
+  const savedFcm = process.env.FCM_SERVICE_ACCOUNT;
+
+  delete process.env.FCM_SERVICE_ACCOUNT;
+  check('без ключа push=disabled (не авария)', notify.configReport().push === 'disabled',
+    notify.configReport().push);
+
+  process.env.FCM_SERVICE_ACCOUNT = 'это-не-json';
+  check('битый ключ push=broken', notify.configReport().push === 'broken', notify.configReport().push);
+
+  process.env.FCM_SERVICE_ACCOUNT = Buffer.from(JSON.stringify({ project_id: 'p' })).toString('base64');
+  check('неполный ключ тоже broken', notify.configReport().push === 'broken', notify.configReport().push);
+
+  // Правдоподобный ключ: настоящая RSA-пара, но Google её не знает.
+  const { privateKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+  });
+  const fake = JSON.stringify({
+    client_email: 'autotest@taketool-test.iam.gserviceaccount.com',
+    private_key: privateKey,
+    project_id: 'taketool-test',
+  });
+  process.env.FCM_SERVICE_ACCOUNT = Buffer.from(fake).toString('base64');
+  check('валидный ключ push=configured', notify.configReport().push === 'configured', notify.configReport().push);
+  process.env.FCM_SERVICE_ACCOUNT = fake;  // сырой JSON тоже должен читаться
+  check('сырой JSON тоже читается', notify.configReport().push === 'configured', notify.configReport().push);
+
+  const { data: pushUser } = await supabase.from('users').select('id').limit(1).maybeSingle();
+  if (pushUser) {
+    // 9a. Устройств не зарегистрировано — доставлять некуда, это не ошибка.
+    const k7 = key('push_nodev');
+    await notify.notifyUser(pushUser.id, null, 'info', '🧪 Тест push без устройств',
+      'Служебная проверка.', { event: 'test.push_nodev', dedupeKey: k7 });
+    const pushRow = await row(`${k7}#push`);
+    check('push встал в очередь отдельной строкой', Boolean(pushRow), 'строки нет');
+    check('без устройств считается доставленным', pushRow?.status === 'sent',
+      `${pushRow?.status} / ${pushRow?.last_error}`);
+    created.push(`${k7}#push`);
+    const { data: n7 } = await supabase.from('notifications').select('id')
+      .eq('user_id', pushUser.id).eq('title', '🧪 Тест push без устройств').maybeSingle();
+    if (n7) notifIds.push(n7.id);
+
+    // 9b. Устройство есть, но Firebase нас не знает → строка ОСТАЁТСЯ в очереди.
+    const fakeToken = 'autotest-fcm-token-' + crypto.randomUUID();
+    await supabase.from('device_tokens').insert({
+      user_id: pushUser.id, token: fakeToken, platform: 'android', app_version: 'autotest',
+    });
+    const k8 = key('push_unreachable');
+    await notify.notifyUser(pushUser.id, null, 'info', '🧪 Тест push с устройством',
+      'Служебная проверка.', { event: 'test.push_unreachable', dedupeKey: k8 });
+    const pushRow2 = await row(`${k8}#push`);
+    check('недоступный FCM → строка не потеряна', Boolean(pushRow2));
+    check('и ждёт повтора, а не умерла', pushRow2?.status === 'pending',
+      `${pushRow2?.status} / ${pushRow2?.last_error}`);
+    check('ошибка OAuth записана', /oauth|invalid/i.test(String(pushRow2?.last_error)),
+      String(pushRow2?.last_error));
+    created.push(`${k8}#push`);
+    const { data: n8 } = await supabase.from('notifications').select('id')
+      .eq('user_id', pushUser.id).eq('title', '🧪 Тест push с устройством').maybeSingle();
+    if (n8) notifIds.push(n8.id);
+    await supabase.from('device_tokens').delete().eq('token', fakeToken);
+
+    // 9c. Без ключа push-строки не плодятся вовсе.
+    delete process.env.FCM_SERVICE_ACCOUNT;
+    const k9 = key('push_off');
+    await notify.notifyUser(pushUser.id, null, 'info', '🧪 Тест push выключен',
+      'Служебная проверка.', { event: 'test.push_off', dedupeKey: k9 });
+    check('без FCM push-строка не создаётся', (await row(`${k9}#push`)) === null, 'строка появилась');
+    const { data: n9 } = await supabase.from('notifications').select('id')
+      .eq('user_id', pushUser.id).eq('title', '🧪 Тест push выключен').maybeSingle();
+    if (n9) notifIds.push(n9.id);
+  } else {
+    console.log('  — пропуск 9a–9c: в базе нет ни одного пользователя');
+  }
+  if (savedFcm) process.env.FCM_SERVICE_ACCOUNT = savedFcm; else delete process.env.FCM_SERVICE_ACCOUNT;
+
   // --- Уборка ---------------------------------------------------------------
   const { error: delErr } = await supabase.from('notification_outbox').delete().in('dedupe_key', created);
   if (delErr) console.log('  ! не удалось убрать тестовые строки:', delErr.message);

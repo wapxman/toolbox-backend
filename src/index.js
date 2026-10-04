@@ -38,7 +38,10 @@ app.get('/', (req, res) => {
 // раньше нельзя было заметить никак.
 app.get('/health', async (req, res) => {
   const problems = [];
-  if (notify.configReport().missing.length) problems.push('notifications_misconfigured');
+  const cfg = notify.configReport();
+  if (cfg.missing.length) problems.push('notifications_misconfigured');
+  // push: 'disabled' — пушей ещё нет, это норма. 'broken' — ключ задан, но битый.
+  if (cfg.push === 'broken') problems.push('push_misconfigured');
   try {
     const o = await notify.stats();
     if (o.dead_24h > 0) problems.push('notifications_dead');
