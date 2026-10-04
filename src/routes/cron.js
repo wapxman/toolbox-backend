@@ -5,6 +5,7 @@
 const express = require('express');
 const supabase = require('../lib/supabase');
 const orders = require('../lib/orders');
+const notify = require('../lib/notify');
 const { refreshSmsStatuses } = require('../lib/sms');
 
 const router = express.Router();
@@ -43,11 +44,12 @@ router.get('/overdue', async (req, res) => {
       marked++;
       const daysOver = Math.max(1, Math.ceil((Date.now() - new Date(r.expected_end).getTime()) / 86_400_000));
       const feeNow = await orders.overdueFeeFor(r);
-      await supabase.from('notifications').insert({
-        user_id: r.user_id, rental_id: r.id, type: 'overdue', title: 'Аренда просрочена',
-        message: `${r.tools?.name || 'Инструмент'} — просрочка ${daysOver} дн. ` +
-          `Текущий штраф ~${feeNow.toLocaleString('ru-RU')} сум и растёт каждый день. Пожалуйста, верните инструмент.`,
-      });
+      // Через outbox, как и все остальные уведомления: ключ с датой — крон ходит
+      // каждый день, а напоминать о той же просрочке надо не чаще раза в сутки.
+      await notify.notifyUser(r.user_id, r.id, 'overdue', 'Аренда просрочена',
+        `${r.tools?.name || 'Инструмент'} — просрочка ${daysOver} дн. ` +
+        `Текущий штраф ~${feeNow.toLocaleString('ru-RU')} сум и растёт каждый день. Пожалуйста, верните инструмент.`,
+        { event: 'rental.overdue', dedupeKey: `rental.overdue:${r.id}:${new Date().toISOString().slice(0, 10)}` });
     }
 
     // 3) Сверка ячеек с заказами. Ячейка обязана быть occupied только если по ней есть
@@ -112,6 +114,20 @@ async function reconcileCells() {
   }
   return fixed;
 }
+
+// GET /api/cron/notifications — воркер outbox'а. Основную доставку делает сам
+// обработчик сразу после записи; этот крон подбирает то, что не ушло: Telegram
+// ответил 429/5xx, лямбду прибили на полпути, база моргнула.
+router.get('/notifications', async (req, res) => {
+  try {
+    const result = await notify.drain({ limit: 50 });
+    if (result.claimed) console.log('[CRON notifications]', JSON.stringify(result));
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('cron notifications error:', err);
+    res.status(500).json({ error: 'drain failed' });
+  }
+});
 
 // GET /api/cron/reconcile — только сверка ячеек (можно дёрнуть руками с CRON_SECRET)
 router.get('/reconcile', async (req, res) => {

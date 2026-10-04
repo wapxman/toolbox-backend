@@ -7,6 +7,7 @@
     { "src": "/(.*)", "dest": "src/index.js" }
   ],
   "crons": [
-    { "path": "/api/cron/overdue", "schedule": "0 3 * * *" }
+    { "path": "/api/cron/overdue", "schedule": "0 3 * * *" },
+    { "path": "/api/cron/notifications", "schedule": "*/5 * * * *" }
   ]
 }

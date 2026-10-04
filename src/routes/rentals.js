@@ -404,7 +404,8 @@ router.post('/:id/extend', async (req, res) => {
     if (uErr) throw uErr;
 
     await orders.notifyUser(req.userId, rental.id, 'payment', 'Аренда продлена',
-      `${rental.tools.name} — +${extra_days} дн., доплата ${extraPrice.toLocaleString('ru-RU')} сум`);
+      `${rental.tools.name} — +${extra_days} дн., доплата ${extraPrice.toLocaleString('ru-RU')} сум`,
+      { event: 'rental.extended' }); // продлевать можно много раз — ключ не фиксируем
     res.json({ rental: updated, extra_price: extraPrice, message: `Аренда продлена на ${extra_days} дн.` });
   } catch (err) {
     console.error('extend error:', err);
@@ -462,7 +463,8 @@ router.post('/:id/return', async (req, res) => {
       overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
       overdueFee > 0
         ? `${rental.tools.name} — штраф ${overdueFee.toLocaleString('ru-RU')} сум, счёт выставлен`
-        : `${rental.tools.name} — спасибо за использование Taketool!`);
+        : `${rental.tools.name} — спасибо за использование Taketool!`,
+      { event: 'rental.returned', dedupeKey: `rental.returned:${rental.id}:user` });
 
     res.json({
       rental: updated, overdue_fee: overdueFee, lock_opened: true,

@@ -14,6 +14,7 @@ const cronRoutes = require('./routes/cron');
 const settingsRoutes = require('./routes/settings');
 const adminRoutes = require('./routes/admin');
 const kerong = require('./lib/kerong');
+const notify = require('./lib/notify');
 
 const app = express();
 
@@ -23,11 +24,32 @@ app.use(express.json());
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     name: 'Taketool API',
     version: '1.2.0',
     kerong: kerong.MOCK_MODE ? 'mock' : 'live'
+  });
+});
+
+// GET /health — для внешнего монитора. Наружу только вердикт: подробности
+// (имена незаданных env, текст ошибки канала) отдаёт /api/admin/health.
+// degraded + 503 означает «API жив, но уведомления не доходят» — именно это
+// раньше нельзя было заметить никак.
+app.get('/health', async (req, res) => {
+  const problems = [];
+  if (notify.configReport().missing.length) problems.push('notifications_misconfigured');
+  try {
+    const o = await notify.stats();
+    if (o.dead_24h > 0) problems.push('notifications_dead');
+    if (o.oldest_queued_age_min > 15) problems.push('notifications_stuck');
+  } catch {
+    problems.push('database_unreachable');
+  }
+  res.status(problems.length ? 503 : 200).json({
+    status: problems.length ? 'degraded' : 'ok',
+    problems,
+    kerong: kerong.MOCK_MODE ? 'mock' : 'live',
   });
 });
 

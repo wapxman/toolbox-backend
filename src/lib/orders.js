@@ -19,6 +19,9 @@
 
 const supabase = require('./supabase');
 const kerong = require('./kerong');
+// Уведомления идут через outbox (lib/notify): сперва строка в базе, потом доставка
+// с повторами. html`…` экранирует подставленное — в сообщения попадает ввод клиента.
+const { notifyUser, notifyAdmin, html } = require('./notify');
 
 const TZ_OFFSET = '+05:00'; // Ташкент
 
@@ -118,8 +121,11 @@ async function createPenalty(rental, fee, provider = 'payme') {
   }).select().single();
   if (error) { console.error('createPenalty', error.message); return null; }
   await notifyUser(rental.user_id, pen.id, 'overdue', 'Счёт за просрочку',
-    `По аренде №${rental.order_number} начислен штраф ${fmt(fee)} сум (п. 4 оферты). Оплатите его в разделе «Заказы» — до оплаты новые аренды недоступны.`);
-  notifyAdmin(`⚠️ <b>Штраф за просрочку</b> №${pen.order_number} — ${fmt(fee)} сум по аренде №${rental.order_number} (${rental.tools?.name || ''})`);
+    `По аренде №${rental.order_number} начислен штраф ${fmt(fee)} сум (п. 4 оферты). Оплатите его в разделе «Заказы» — до оплаты новые аренды недоступны.`,
+    { event: 'penalty.created', dedupeKey: `penalty.created:${pen.id}:user` });
+  await notifyAdmin(
+    html`⚠️ <b>Штраф за просрочку</b> №${pen.order_number} — ${fmt(fee)} сум по аренде №${rental.order_number} (${rental.tools?.name || ''})`,
+    { event: 'penalty.created', dedupeKey: `penalty.created:${pen.id}:ops` });
   return pen;
 }
 
@@ -154,25 +160,6 @@ function cellOf(rental) {
 }
 async function openCellFor(rental) { await openLock(cellOf(rental)); }
 
-async function notifyUser(userId, rentalId, type, title, message) {
-  if (!userId) return;
-  try {
-    await supabase.from('notifications').insert({ user_id: userId, rental_id: rentalId, type, title, message });
-  } catch (e) { console.error('notify user failed', e.message); }
-}
-
-// Telegram операторам (env ADMIN_TG_TOKEN + ADMIN_TG_CHAT). Без env — тихо.
-async function notifyAdmin(text) {
-  const token = process.env.ADMIN_TG_TOKEN, chat = process.env.ADMIN_TG_CHAT;
-  if (!token || !chat) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chat, text, parse_mode: 'HTML' }),
-    });
-  } catch (e) { console.error('notify admin failed', e.message); }
-}
-
 const fmt = n => Number(n || 0).toLocaleString('ru-RU');
 function describe(r) {
   const what = r.kind === 'buy' ? 'покупка' : r.kind === 'courier_return' ? 'возврат курьером' : `аренда ${r.days} дн.`;
@@ -185,6 +172,15 @@ function addressLine(r) {
   if (r.delivery_floor) parts.push(`этаж ${r.delivery_floor}`);
   if (r.delivery_apt) parts.push(`кв. ${r.delivery_apt}`);
   return parts.filter(Boolean).join(', ');
+}
+
+// Всё, что нужно курьеру: куда, когда, кому звонить и что просил клиент.
+// Один блок на аренду, покупку и вызов курьера — раньше каждое сообщение
+// собиралось по-своему, и комментарий клиента («домофон не работает, звоните»)
+// попадал ТОЛЬКО в аренду с доставкой. По покупке курьер его не видел.
+function deliveryBlock(r) {
+  return html`${addressLine(r)}\n${r.delivery_slot_label || ''}\n☎ ${r.recipient_phone || ''}`
+    + (r.delivery_comment ? html`\n💬 ${r.delivery_comment}` : '');
 }
 
 // --- Склад новых единиц ---
@@ -218,12 +214,16 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
   });
   const paidText = `Оплачено ${fmt(amountSum)} сум через ${method === 'click' ? 'Click' : 'Payme'}.`;
   const name = rental.tools?.name || 'инструмент';
+  // Касса может прислать PerformTransaction повторно. Статус выше уже защищает от
+  // повторной обработки, а эти ключи — от повторного сообщения, если две попытки
+  // кассы придут одновременно и обе пройдут проверку статуса.
+  const paidKey = (to) => ({ event: 'order.paid', dedupeKey: `order.paid:${rentalId}:${to}` });
 
   // 0) Оплата штрафа за просрочку: счёт закрыт, блокировка снята
   if (rental.kind === 'penalty') {
     await supabase.from('rentals').update({ status: 'completed', paid_at: nowIso, actual_end: nowIso }).eq('id', rentalId);
     await notifyUser(rental.user_id, rentalId, 'payment', 'Штраф оплачен',
-      `${paidText} Спасибо — новые аренды снова доступны.`);
+      `${paidText} Спасибо — новые аренды снова доступны.`, paidKey('user'));
     return rental;
   }
 
@@ -234,8 +234,10 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
       await supabase.from('rentals').update({ return_method: 'courier' }).eq('id', rental.parent_rental_id);
     }
     await notifyUser(rental.user_id, rentalId, 'payment', 'Курьер вызван',
-      `${paidText} Курьер заберёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`);
-    notifyAdmin(`🔁 <b>Возврат курьером</b> №${rental.order_number}\n${name}\n${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}`);
+      `${paidText} Курьер заберёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`, paidKey('user'));
+    await notifyAdmin(
+      html`🔁 <b>Возврат курьером</b> №${rental.order_number}\n${name}\n` + deliveryBlock(rental),
+      paidKey('ops'));
     return rental;
   }
 
@@ -245,16 +247,19 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
     await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
     if (rental.fulfillment === 'delivery') {
       await notifyUser(rental.user_id, rentalId, 'payment', 'Покупка оплачена',
-        `${paidText} Курьер привезёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`);
+        `${paidText} Курьер привезёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`, paidKey('user'));
     } else {
       await notifyUser(rental.user_id, rentalId, 'payment', 'Покупка оплачена',
-        `${paidText} Мы положим новый ${name} в ячейку бокса и пришлём уведомление — тогда его можно будет забрать.`);
+        `${paidText} Мы положим новый ${name} в ячейку бокса и пришлём уведомление — тогда его можно будет забрать.`, paidKey('user'));
     }
-    notifyAdmin(`🛒 <b>Покупка</b> №${rental.order_number} — ${name}, ${fmt(rental.total_price)} сум\n` +
-      (rental.fulfillment === 'delivery'
-        ? `🚚 ${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}`
-        : `📦 Самовывоз: положить новую единицу в свободную ячейку и нажать «Готов к выдаче»`) +
-      (ok ? '' : '\n⚠️ ОСТАТКА НА СКЛАДЕ НЕ БЫЛО — проверьте наличие'));
+    const how = rental.fulfillment === 'delivery'
+      ? '🚚 ' + deliveryBlock(rental)
+      : '📦 Самовывоз: положить новую единицу в свободную ячейку и нажать «Готов к выдаче»';
+    await notifyAdmin(
+      html`🛒 <b>Покупка</b> №${rental.order_number} — ${name}, ${fmt(rental.total_price)} сум\n`
+      + how
+      + (ok ? '' : '\n⚠️ ОСТАТКА НА СКЛАДЕ НЕ БЫЛО — проверьте наличие'),
+      paidKey('ops'));
     return rental;
   }
 
@@ -263,8 +268,11 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
     await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
     if (rental.tools?.cell_id) await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
     await notifyUser(rental.user_id, rentalId, 'payment', 'Заказ оплачен',
-      `${paidText} Курьер привезёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`);
-    notifyAdmin(`🚚 <b>Аренда с доставкой</b> №${rental.order_number}\n${describe(rental)}\n${fmt(rental.total_price)} сум\n${addressLine(rental)}\n${rental.delivery_slot_label || ''}\n☎ ${rental.recipient_phone || ''}${rental.delivery_comment ? '\n💬 ' + rental.delivery_comment : ''}`);
+      `${paidText} Курьер привезёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`, paidKey('user'));
+    await notifyAdmin(
+      html`🚚 <b>Аренда с доставкой</b> №${rental.order_number}\n${describe(rental)}\n${fmt(rental.total_price)} сум\n`
+      + deliveryBlock(rental),
+      paidKey('ops'));
     return rental;
   }
 
@@ -275,8 +283,23 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
     status: 'active', paid_at: nowIso, started_at: nowIso, expected_end: expectedEnd.toISOString(),
   }).eq('id', rentalId);
   if (rental.tools?.cell_id) await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
-  try { await openCellFor(rental); } catch (e) { console.error('rent pickup: lock open failed', e.message); }
-  await notifyUser(rental.user_id, rentalId, 'payment', 'Оплата прошла', `${paidText} Замок открыт — заберите инструмент!`);
+  let lockOpened = true;
+  try {
+    await openCellFor(rental);
+  } catch (e) {
+    // Клиент заплатил и стоит у бокса, а замок не открылся. Раньше об этом знал
+    // только лог Vercel, куда никто не смотрит, — зовём оператора.
+    lockOpened = false;
+    console.error('rent pickup: lock open failed', e.message);
+    await notifyAdmin(
+      html`🚨 <b>Замок не открылся</b> по оплаченной аренде №${rental.order_number}\n${name}, ячейка ${cellOf(rental)?.cell_number || '?'}\n${e.message}\n☎ клиент ждёт у бокса`,
+      { event: 'lock.failed', dedupeKey: `lock.failed:${rentalId}` });
+  }
+  await notifyUser(rental.user_id, rentalId, 'payment', 'Оплата прошла',
+    lockOpened
+      ? `${paidText} Замок открыт — заберите инструмент!`
+      : `${paidText} Замок не открылся — мы уже разбираемся. Нажмите «Открыть ячейку» в заказе через минуту или напишите в поддержку.`,
+    paidKey('user'));
   return rental;
 }
 
@@ -336,8 +359,12 @@ async function cancelOrder(rental, by = 'user') {
   }
 
   await notifyUser(rental.user_id, rental.id, 'info', 'Заказ отменён',
-    `Заказ №${rental.order_number} отменён. Деньги (${fmt(rental.total_price)} сум) вернутся тем же способом оплаты в течение 1–3 рабочих дней.`);
-  notifyAdmin(`❌ <b>Отмена заказа</b> №${rental.order_number} (${by === 'user' ? 'клиент' : 'админ'})\n${describe(rental)}\n💸 Вернуть ${fmt(rental.total_price)} сум в кассе ${rental.payment_provider}${outOfPlace ? '\n📦 Инструмент вне места — вернуть в бокс/на склад' : ''}`);
+    `Заказ №${rental.order_number} отменён. Деньги (${fmt(rental.total_price)} сум) вернутся тем же способом оплаты в течение 1–3 рабочих дней.`,
+    { event: 'order.cancelled', dedupeKey: `order.cancelled:${rental.id}:user` });
+  await notifyAdmin(
+    html`❌ <b>Отмена заказа</b> №${rental.order_number} (${by === 'user' ? 'клиент' : 'админ'})\n${describe(rental)}\n💸 Вернуть ${fmt(rental.total_price)} сум в кассе ${rental.payment_provider}`
+    + (outOfPlace ? '\n📦 Инструмент вне места — вернуть в бокс/на склад' : ''),
+    { event: 'order.cancelled', dedupeKey: `order.cancelled:${rental.id}:ops` });
   return { ok: true, refund_required: true };
 }
 

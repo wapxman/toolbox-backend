@@ -3,6 +3,7 @@
 const express = require('express');
 const supabase = require('../lib/supabase');
 const orders = require('../lib/orders');
+const notify = require('../lib/notify');
 
 const router = express.Router();
 
@@ -14,6 +15,26 @@ function adminOnly(req, res, next) {
   next();
 }
 router.use(adminOnly);
+
+// GET /api/admin/health — подробное состояние уведомлений: какие env не заданы,
+// сколько строк висит в очереди, что не доставилось и с какой ошибкой.
+router.get('/health', async (req, res) => {
+  try {
+    res.json({ notifications: { ...notify.configReport(), outbox: await notify.stats() } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/notifications/drain — разобрать очередь руками, не дожидаясь крона
+// (после того как починили канал: вернули бота в группу, поправили env).
+router.post('/notifications/drain', async (req, res) => {
+  try {
+    res.json(await notify.drain({ limit: 50 }));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // PATCH /api/admin/orders/:id
 // { action: open_cell | packed | dispatched | delivered | ready | picked_up | restocked | refunded | cancel,
@@ -27,6 +48,10 @@ router.patch('/orders/:id', async (req, res) => {
     const upd = (fields) => supabase.from('rentals').update(fields).eq('id', rental.id);
     const name = rental.tools?.name || 'инструмент';
     const inDelivery = rental.status === 'pending_delivery';
+    // Админка — это кнопки, по которым можно щёлкнуть дважды. Переходы защищены
+    // проверками статуса, а уведомление — этим ключом: на один заказ одно
+    // сообщение о каждом событии, даже если PATCH пришёл два раза.
+    const once = (event) => ({ event, dedupeKey: `${event}:${rental.id}:user` });
 
     switch (action) {
       case 'open_cell': {
@@ -42,7 +67,8 @@ router.patch('/orders/:id', async (req, res) => {
         if (rental.fulfillment !== 'delivery') return res.status(400).json({ error: 'Для самовывоза используйте «Готов к выдаче»' });
         await upd({ delivery_status: 'packed', packed_at: now });
         await orders.notifyUser(rental.user_id, rental.id, 'info', 'Заказ собран',
-          `${name} готов к отправке. Курьер выедет к вам: ${rental.delivery_slot_label || 'в выбранное время'}.`);
+          `${name} готов к отправке. Курьер выедет к вам: ${rental.delivery_slot_label || 'в выбранное время'}.`,
+          once('order.packed'));
         return res.json({ ok: true });
       }
 
@@ -58,7 +84,8 @@ router.patch('/orders/:id', async (req, res) => {
         await supabase.from('cells').update({ status: 'occupied' }).eq('id', cell.id);
         await upd({ delivery_status: 'ready', pickup_cell_id: cell.id, packed_at: now });
         await orders.notifyUser(rental.user_id, rental.id, 'info', 'Покупка готова к выдаче',
-          `${name} лежит в боксе «${cell.boxes?.name || ''}», ячейка ${cell.cell_number}. Откройте заказ в приложении и нажмите «Открыть ячейку», когда будете у бокса.`);
+          `${name} лежит в боксе «${cell.boxes?.name || ''}», ячейка ${cell.cell_number}. Откройте заказ в приложении и нажмите «Открыть ячейку», когда будете у бокса.`,
+          once('order.ready'));
         return res.json({ ok: true });
       }
 
@@ -76,7 +103,8 @@ router.patch('/orders/:id', async (req, res) => {
         const who = courier_name ? `Курьер ${courier_name}${courier_phone ? ', ' + courier_phone : ''}` : 'Курьер';
         await orders.notifyUser(rental.user_id, rental.id, 'info',
           rental.kind === 'courier_return' ? 'Курьер едет за инструментом' : 'Курьер в пути',
-          `${who} ${rental.kind === 'courier_return' ? 'скоро заберёт' : 'везёт'} ${name}. ${rental.delivery_slot_label || ''}`.trim());
+          `${who} ${rental.kind === 'courier_return' ? 'скоро заберёт' : 'везёт'} ${name}. ${rental.delivery_slot_label || ''}`.trim(),
+          once('order.dispatched'));
         return res.json({ ok: true });
       }
 
@@ -85,12 +113,14 @@ router.patch('/orders/:id', async (req, res) => {
         if (rental.delivery_status !== 'dispatched') return res.status(400).json({ error: 'Сначала «Передан курьеру»' });
         if (rental.kind === 'buy') {
           await upd({ delivery_status: 'delivered', delivered_at: now, status: 'completed', actual_end: now });
-          await orders.notifyUser(rental.user_id, rental.id, 'info', 'Покупка доставлена', `${name} передан вам. Спасибо за покупку!`);
+          await orders.notifyUser(rental.user_id, rental.id, 'info', 'Покупка доставлена',
+            `${name} передан вам. Спасибо за покупку!`, once('order.delivered'));
         } else {
           const end = new Date(); end.setDate(end.getDate() + (rental.days || 1));
           await upd({ delivery_status: 'delivered', delivered_at: now, status: 'active', started_at: now, expected_end: end.toISOString() });
           await orders.notifyUser(rental.user_id, rental.id, 'info', 'Инструмент доставлен',
-            `${name} у вас. Срок аренды ${rental.days} дн. — вернуть до ${end.toLocaleDateString('ru-RU')}.`);
+            `${name} у вас. Срок аренды ${rental.days} дн. — вернуть до ${end.toLocaleDateString('ru-RU')}.`,
+            once('order.delivered'));
         }
         return res.json({ ok: true });
       }
@@ -112,7 +142,8 @@ router.patch('/orders/:id', async (req, res) => {
         }
         await orders.notifyUser(rental.user_id, rental.parent_rental_id || rental.id, 'info',
           overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
-          overdueFee > 0 ? `${name} принят курьером. Штраф за просрочку ${orders.fmt(overdueFee)} сум.` : `${name} принят курьером. Спасибо за использование Taketool!`);
+          overdueFee > 0 ? `${name} принят курьером. Штраф за просрочку ${orders.fmt(overdueFee)} сум.` : `${name} принят курьером. Спасибо за использование Taketool!`,
+          once('order.picked_up'));
         return res.json({ ok: true, overdue_fee: overdueFee });
       }
 
@@ -134,7 +165,8 @@ router.patch('/orders/:id', async (req, res) => {
         if (rental.refund_status !== 'pending') return res.status(400).json({ error: 'Возврат денег не ожидается' });
         await upd({ refund_status: 'done' });
         await orders.notifyUser(rental.user_id, rental.id, 'payment', 'Деньги возвращены',
-          `Возврат ${orders.fmt(rental.total_price)} сум по заказу №${rental.order_number} выполнен.`);
+          `Возврат ${orders.fmt(rental.total_price)} сум по заказу №${rental.order_number} выполнен.`,
+          once('order.refunded'));
         return res.json({ ok: true });
       }
 
