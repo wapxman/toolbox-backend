@@ -13,6 +13,7 @@ const clickRoutes = require('./routes/click');
 const cronRoutes = require('./routes/cron');
 const settingsRoutes = require('./routes/settings');
 const adminRoutes = require('./routes/admin');
+const wheelRoutes = require('./routes/wheel');
 const kerong = require('./lib/kerong');
 const notify = require('./lib/notify');
 
@@ -76,6 +77,8 @@ app.use('/api/cron', cronRoutes);
 app.use('/api/settings', settingsRoutes);
 // Админские переходы заказов (X-Admin-Secret)
 app.use('/api/admin', adminRoutes);
+// Колесо Фортуны и бонусный кошелёк (авторизация пользователя)
+app.use('/api/wheel', wheelRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
