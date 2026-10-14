@@ -1,21 +1,38 @@
 // Колесо Фортуны и кошелёк — ручки для приложения.
 const express = require('express');
 const auth = require('../middleware/auth');
+const optionalAuth = require('../middleware/optionalAuth');
 const wheel = require('../lib/wheel');
 
 const router = express.Router();
 
-// GET /api/wheel — что показать на экране колеса.
+// Устройство, с которого крутят. Нужно, чтобы гость мог выиграть до
+// регистрации, а попытка при этом осталась одна: иначе выход из аккаунта
+// давал бы бесконечные прокрутки.
+const deviceOf = (req) => {
+  const raw = req.get('X-Device-Id') || req.body?.device_id || req.query?.device_id || '';
+  const id = String(raw).trim();
+  // Длину режем: это ключ в запросах, а не место для чужого текста.
+  return id && id.length <= 128 ? id : null;
+};
+
+// GET /api/wheel — что показать на экране колеса. Открыт и гостю: акция
+// существует ради незарегистрированных, за дверью она бессмысленна.
 // Призы отдаём БЕЗ весов: шансы это внутренняя кухня, в приложении им не место.
-router.get('/', auth, async (req, res) => {
+router.get('/', optionalAuth, async (req, res) => {
   try {
     const cfg = await wheel.getConfig();
-    const [left, balance] = await Promise.all([
-      wheel.spinsLeft(req.userId, cfg),
-      wheel.balanceOf(req.userId),
+    const deviceId = deviceOf(req);
+    const [left, balance, state] = await Promise.all([
+      wheel.spinsLeft({ userId: req.userId, deviceId }, cfg),
+      req.userId ? wheel.balanceOf(req.userId) : Promise.resolve(0),
+      wheel.promoState(cfg),
     ]);
     res.json({
-      enabled: !!cfg.enabled,
+      // Акция «включена» только если идёт на самом деле: срок не вышел и
+      // победители не кончились. Иначе кнопка обещала бы несуществующее.
+      enabled: state.open,
+      closed_reason: state.reason, // disabled | finished | all_won | null
       spins_left: left,
       balance,
       expires_days: Number(cfg.expires_days || 30),
@@ -23,6 +40,23 @@ router.get('/', auth, async (req, res) => {
       prizes: (cfg.prizes || []).map((p) => ({
         code: p.code, label: p.label, kind: p.kind, amount: Number(p.amount || 0),
       })),
+      // Раскладка секторов: коды призов по кругу, дешёвые повторяются. Считаем
+      // здесь, потому что строится она из весов, а веса наружу не отдаём.
+      sectors: wheel.layoutSectors(cfg.prizes, Number(cfg.sectors_count || 12)),
+      // Гостю приз зачислится только после регистрации. Приложение обязано
+      // сказать об этом ДО прокрутки, иначе выйдет ловушка.
+      requires_account: !req.userId,
+      // Правила акции для экрана «Правила». Требование Apple 5.3.2 и Google
+      // Play (Gamified Loyalty Programs): фиксированное число победителей,
+      // дедлайн участия и срок выдачи приза должны быть видны в приложении.
+      rules: {
+        winners_limit: state.winnersLimit,
+        winners_so_far: state.winners,
+        ends_at: cfg.ends_at || null,
+        spins_per_user: Number(cfg.spins_per_user || 1),
+        expires_days: Number(cfg.expires_days || 30),
+        max_pay_pct: Number(cfg.max_pay_pct || 50),
+      },
     });
   } catch (err) {
     console.error('wheel get error:', err);
@@ -31,21 +65,39 @@ router.get('/', auth, async (req, res) => {
 });
 
 // POST /api/wheel/spin — крутить. Приз выбирает сервер.
-router.post('/spin', auth, async (req, res) => {
+// Гостю тоже можно: выигрыш запишется за устройством и дождётся регистрации.
+router.post('/spin', optionalAuth, async (req, res) => {
   try {
-    const { prize, balance } = await wheel.spin(req.userId);
+    const { prize, balance, pending } = await wheel.spin({
+      userId: req.userId,
+      deviceId: deviceOf(req),
+    });
     res.json({
       prize: { code: prize.code, label: prize.label, kind: prize.kind, amount: Number(prize.amount || 0) },
       balance,
+      pending, // true — приз ждёт регистрации
     });
   } catch (err) {
     // Ожидаемые отказы отдаём 400 с человеческим текстом, а не 500: это не
     // поломка, а правило акции, и приложение должно показать его словами.
-    if (err.code === 'no_spins' || err.code === 'disabled' || err.code === 'no_prizes') {
+    if (err.code === 'no_spins' || err.code === 'disabled' || err.code === 'closed'
+        || err.code === 'no_prizes' || err.code === 'no_owner') {
       return res.status(400).json({ error: err.message, code: err.code });
     }
     console.error('wheel spin error:', err);
     res.status(500).json({ error: 'Не удалось прокрутить колесо' });
+  }
+});
+
+// POST /api/wheel/claim — забрать выигрыш, накрученный до регистрации.
+// Зовётся приложением сразу после входа. Без device_id забирать нечего.
+router.post('/claim', auth, async (req, res) => {
+  try {
+    const { claimed, amount } = await wheel.claimFor(req.userId, deviceOf(req));
+    res.json({ claimed, amount, balance: await wheel.balanceOf(req.userId) });
+  } catch (err) {
+    console.error('wheel claim error:', err);
+    res.status(500).json({ error: 'Не удалось забрать выигрыш' });
   }
 });
 

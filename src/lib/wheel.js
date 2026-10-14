@@ -22,6 +22,14 @@ const DEFAULTS = {
   expires_days: 30,
   // Одна прокрутка на человека, навсегда (решение владельца: второй нет).
   spins_per_user: 1,
+  // Правила акции. Их требуют оба магазина: Apple (5.3.2) и Google Play
+  // (Gamified Loyalty Programs) хотят видеть фиксированное число победителей,
+  // дедлайн участия и срок выдачи приза ВНУТРИ приложения.
+  //
+  // ⚠️ Это не декорация: лимит и дата реально закрывают акцию. Обещание,
+  // которое не исполняется кодом, — это обещание, которого нет.
+  winners_limit: 1000,                   // решение владельца 14.10.2026
+  ends_at: '2026-12-31T23:59:59+05:00',  // до конца года, время ташкентское
   // weight — доля в розыгрыше. Не процент: сумма может быть любой, сервер
   // делит на общую сумму весов. Так добавление приза не требует пересчёта
   // остальных. weight 0 — приз на колесе показан, но не выпадает.
@@ -82,30 +90,174 @@ function drawPrize(prizes, rnd = Math.random) {
   return pool[pool.length - 1];
 }
 
-/** Сколько прокруток осталось у пользователя. */
-async function spinsLeft(userId, cfg) {
-  const { count, error } = await supabase
+/** Раскладка секторов колеса.
+ *
+ * Дешёвый приз занимает несколько секторов, дорогой — один. Так колесо
+ * выглядит богатым (взгляд ведут одиночные редкие сектора), а видимая частота
+ * честно совпадает с настоящим шансом: доля секторов пропорциональна весу.
+ *
+ * ⚠️ Считает СЕРВЕР, а не телефон: веса — внутренняя кухня, наружу они не
+ * уходят, поэтому собрать такую раскладку на клиенте нечем.
+ *
+ * Приз с нулевым весом остаётся на колесе одним сектором: он показан, но не
+ * выпадает — так задумано в DEFAULTS, и раскладка этого не меняет.
+ */
+function layoutSectors(prizes, target = 12) {
+  const pool = (prizes || []).filter((p) => p && p.code);
+  if (pool.length < 2) return pool.map((p) => p.code);
+  // Призов больше, чем секторов — каждому по одному, иначе кто-то исчезнет.
+  if (pool.length >= target) return pool.map((p) => p.code);
+
+  const w = pool.map((p) => Math.max(0, Number(p.weight) || 0));
+  const totalW = w.reduce((s, x) => s + x, 0);
+
+  const counts = pool.map(() => 1); // минимум один сектор каждому призу
+  const left = target - pool.length;
+  if (totalW > 0 && left > 0) {
+    const share = w.map((x) => (x / totalW) * left);
+    share.forEach((s, i) => { counts[i] += Math.floor(s); });
+    // Остаток от округления отдаём тем, у кого дробная часть больше.
+    const rest = left - share.reduce((s, x) => s + Math.floor(x), 0);
+    const byFrac = share
+      .map((s, i) => ({ frac: s - Math.floor(s), i }))
+      .sort((a, b) => b.frac - a.frac);
+    for (let k = 0; k < rest; k++) counts[byFrac[k % byFrac.length].i]++;
+  }
+
+  // Расставляем по кругу так, чтобы одинаковые сектора не липли друг к другу:
+  // каждый раз берём приз, которого осталось больше всех, но не тот же, что
+  // лёг последним — кроме случая, когда других уже не осталось.
+  const restCount = counts.slice();
+  const out = [];
+  for (let k = 0; k < target; k++) {
+    let pick = -1;
+    let fallback = -1;
+    for (let i = 0; i < pool.length; i++) {
+      if (restCount[i] <= 0) continue;
+      if (fallback < 0 || restCount[i] > restCount[fallback]) fallback = i;
+      if (out.length && pool[i].code === out[out.length - 1]) continue;
+      if (pick < 0 || restCount[i] > restCount[pick]) pick = i;
+    }
+    if (pick < 0) pick = fallback;
+    if (pick < 0) break; // разложили всё, что было
+    out.push(pool[pick].code);
+    restCount[pick]--;
+  }
+
+  // Круг замкнут: если последний сектор совпал с первым, меняем его местами
+  // с подходящим соседом, иначе на стыке получится двойной сектор.
+  if (out.length > 2 && out[0] === out[out.length - 1]) {
+    for (let i = out.length - 2; i > 0; i--) {
+      if (out[i] !== out[0] && out[i] !== out[i - 1]) {
+        [out[i], out[out.length - 1]] = [out[out.length - 1], out[i]];
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/** Сколько прокруток осталось.
+ *
+ * owner — { userId } у вошедшего, { deviceId } у гостя, у вошедшего с телефона
+ * известны оба. Считаем ПО ОБОИМ сразу: иначе человек крутит гостем, заводит
+ * аккаунт и получает вторую попытку на то же устройство.
+ */
+async function spinsLeft(owner, cfg) {
+  const userId = owner && owner.userId;
+  const deviceId = owner && owner.deviceId;
+  if (!userId && !deviceId) return 0;
+
+  let q = supabase
     .from('wheel_spins')
     .select('id', { count: 'exact', head: true })
-    .eq('user_id', userId)
     .neq('status', 'cancelled');
+
+  // PostgREST: «или» по двум колонкам. Пустую сторону не добавляем, иначе
+  // условие станет `device_id=eq.null` и перестанет совпадать с чем-либо.
+  if (userId && deviceId) {
+    q = q.or(`user_id.eq.${userId},device_id.eq.${deviceId}`);
+  } else if (userId) {
+    q = q.eq('user_id', userId);
+  } else {
+    q = q.eq('device_id', deviceId);
+  }
+
+  const { count, error } = await q;
   if (error) throw new Error('не удалось посчитать прокрутки: ' + error.message);
   return Math.max(0, Number(cfg.spins_per_user || 0) - Number(count || 0));
 }
 
-/** Прокрутить колесо. Возвращает { prize, balance } либо бросает понятную ошибку. */
-async function spin(userId) {
-  const cfg = await getConfig();
-  if (!cfg.enabled) { const e = new Error('Акция сейчас не проводится'); e.code = 'disabled'; throw e; }
+/** Сколько призов уже разыграно. Нужно, чтобы остановить акцию на обещанном
+ *  числе победителей: объявили тысячу — значит тысяча, а не сколько придёт. */
+async function winnersCount() {
+  const { count, error } = await supabase
+    .from('wheel_spins')
+    .select('id', { count: 'exact', head: true })
+    .neq('status', 'cancelled');
+  if (error) throw new Error('не удалось посчитать победителей: ' + error.message);
+  return Number(count || 0);
+}
 
-  const left = await spinsLeft(userId, cfg);
+/** Идёт ли акция прямо сейчас: включена, срок не вышел, победители не кончились.
+ *  Возвращает { open, reason, winners, winnersLimit, endsAt }. */
+async function promoState(cfg) {
+  const winnersLimit = Number(cfg.winners_limit || 0);
+  const endsAt = cfg.ends_at ? new Date(cfg.ends_at) : null;
+
+  if (!cfg.enabled) return { open: false, reason: 'disabled', winners: 0, winnersLimit, endsAt };
+  if (endsAt && Date.now() > endsAt.getTime()) {
+    return { open: false, reason: 'finished', winners: 0, winnersLimit, endsAt };
+  }
+
+  // ⚠️ Проверка и запись прокрутки не атомарны: если тысячный приз разыграют
+  // несколько человек в одну секунду, победителей может оказаться на единицы
+  // больше. Для акции на тысячу это допустимый перелёт, а не дыра — блокировка
+  // всей таблицы на каждую прокрутку обошлась бы дороже.
+  const winners = winnersLimit > 0 ? await winnersCount() : 0;
+  if (winnersLimit > 0 && winners >= winnersLimit) {
+    return { open: false, reason: 'all_won', winners, winnersLimit, endsAt };
+  }
+  return { open: true, reason: null, winners, winnersLimit, endsAt };
+}
+
+/** Прокрутить колесо. Возвращает { prize, balance, pending } либо бросает
+ *  понятную ошибку.
+ *
+ *  owner — { userId } у вошедшего, { deviceId } у гостя.
+ *  Гостю приз ЗАПИСЫВАЕТСЯ, но на счёт не кладётся: счёта у него ещё нет.
+ *  Начисление произойдёт в claimFor() сразу после регистрации — до тех пор
+ *  выигрыш числится за устройством и ждёт (pending: true).
+ */
+async function spin(owner) {
+  const userId = (owner && owner.userId) || null;
+  const deviceId = (owner && owner.deviceId) || null;
+  if (!userId && !deviceId) {
+    const e = new Error('Не удалось определить устройство'); e.code = 'no_owner'; throw e;
+  }
+
+  const cfg = await getConfig();
+  const state = await promoState(cfg);
+  if (!state.open) {
+    const e = new Error(
+      state.reason === 'all_won'
+        ? 'Все призы акции уже разыграны'
+        : state.reason === 'finished'
+            ? 'Акция завершена'
+            : 'Акция сейчас не проводится',
+    );
+    e.code = state.reason === 'disabled' ? 'disabled' : 'closed';
+    throw e;
+  }
+
+  const left = await spinsLeft({ userId, deviceId }, cfg);
   if (left <= 0) { const e = new Error('Вы уже использовали свою попытку'); e.code = 'no_spins'; throw e; }
 
   const prize = drawPrize(cfg.prizes);
   if (!prize) { const e = new Error('Призы не настроены'); e.code = 'no_prizes'; throw e; }
 
   let walletEntryId = null;
-  if (prize.kind === 'bonus' && Number(prize.amount) > 0) {
+  if (userId && prize.kind === 'bonus' && Number(prize.amount) > 0) {
     const expires = new Date(Date.now() + Number(cfg.expires_days || 30) * 86400_000).toISOString();
     const { data, error } = await supabase
       .from('wallet_entries')
@@ -124,11 +276,13 @@ async function spin(userId) {
 
   const { error: spinErr } = await supabase.from('wheel_spins').insert({
     user_id: userId,
+    device_id: deviceId,
     prize_code: prize.code,
     prize_label: prize.label,
     amount: Number(prize.amount || 0),
     kind: prize.kind,
     wallet_entry_id: walletEntryId,
+    claimed_at: userId ? new Date().toISOString() : null,
   });
   // ⚠️ Если запись прокрутки не прошла, а бонус уже начислен — откатываем
   // начисление. Иначе человек получит бесплатную попытку и деньги: прокруток
@@ -138,7 +292,83 @@ async function spin(userId) {
     throw new Error('не удалось записать прокрутку: ' + spinErr.message);
   }
 
-  return { prize, balance: await balanceOf(userId) };
+  return {
+    prize,
+    balance: userId ? await balanceOf(userId) : 0,
+    pending: !userId, // приз ждёт регистрации
+  };
+}
+
+/** Забрать выигрыши, накрученные этим устройством до регистрации.
+ *
+ *  Зовётся сразу после входа. Берёт прокрутки устройства без владельца,
+ *  привязывает их к аккаунту и начисляет бонус. Возвращает сколько начислено.
+ *
+ *  ⚠️ Порядок обратный спину: сперва создаём начисление, и только если оно
+ *  прошло — помечаем прокрутку забранной. Упадём посередине — прокрутка
+ *  останется неотмеченной и начисление повторится при следующем входе, что
+ *  лучше, чем молча потерять выигрыш. От двойного начисления защищает
+ *  claimed_at: отмеченную прокрутку второй раз уже не возьмём.
+ */
+async function claimFor(userId, deviceId) {
+  if (!userId || !deviceId) return { claimed: 0, amount: 0 };
+  const cfg = await getConfig();
+
+  // ⚠️ Сколько прокруток человеку ещё положено. Без этой проверки появляется
+  // дыра: гость крутит, приз не нравится, он сносит приложение и ставит заново
+  // — устройство новое, попытка новая, и так до главного приза, а забрать
+  // можно всё разом. Привязываем не больше, чем положено на аккаунт.
+  const allowed = await spinsLeft({ userId }, cfg);
+  if (allowed <= 0) return { claimed: 0, amount: 0 };
+
+  const { data: rows, error } = await supabase
+    .from('wheel_spins')
+    .select('id, prize_label, amount, kind')
+    .eq('device_id', deviceId)
+    .is('user_id', null)
+    .is('claimed_at', null)
+    .neq('status', 'cancelled')
+    // Самая ранняя прокрутка, а не самая выгодная: берём ту, что человек
+    // действительно сделал первой.
+    .order('created_at', { ascending: true })
+    .limit(allowed);
+  if (error) throw new Error('не удалось найти выигрыши устройства: ' + error.message);
+
+  let claimed = 0;
+  let total = 0;
+  for (const row of rows || []) {
+    let walletEntryId = null;
+    if (row.kind === 'bonus' && Number(row.amount) > 0) {
+      const expires = new Date(Date.now() + Number(cfg.expires_days || 30) * 86400_000).toISOString();
+      const { data, error: insErr } = await supabase
+        .from('wallet_entries')
+        .insert({
+          user_id: userId,
+          amount: Number(row.amount),
+          kind: 'wheel_win',
+          expires_at: expires,
+          note: `Колесо Фортуны: ${row.prize_label}`,
+        })
+        .select('id')
+        .single();
+      if (insErr) throw new Error('не удалось начислить выигрыш: ' + insErr.message);
+      walletEntryId = data.id;
+      total += Number(row.amount);
+    }
+
+    const { error: updErr } = await supabase
+      .from('wheel_spins')
+      .update({ user_id: userId, wallet_entry_id: walletEntryId, claimed_at: new Date().toISOString() })
+      .eq('id', row.id)
+      .is('claimed_at', null); // гонка двух входов: второй не перезапишет
+    if (updErr) {
+      if (walletEntryId) await supabase.from('wallet_entries').delete().eq('id', walletEntryId);
+      throw new Error('не удалось закрепить выигрыш: ' + updErr.message);
+    }
+    claimed++;
+  }
+
+  return { claimed, amount: total };
 }
 
 /** Списать бонус под заказ. Списание ссылается на конкретные начисления
@@ -208,5 +438,6 @@ async function refund(userId, rentalId) {
 
 module.exports = {
   DEFAULTS, SETTINGS_KEY, getConfig, dropCache,
-  balanceOf, applicable, drawPrize, spinsLeft, spin, spend, refund,
+  balanceOf, applicable, drawPrize, layoutSectors,
+  winnersCount, promoState, spinsLeft, spin, claimFor, spend, refund,
 };
