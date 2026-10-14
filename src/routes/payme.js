@@ -173,16 +173,22 @@ async function performTransaction(params) {
   if (tx.state !== STATE_CREATED) return { error: ERR.cannotPerform };
 
   const performTime = Date.now();
-  await supabase.from('payme_transactions')
-    .update({ state: STATE_COMPLETED, perform_time: performTime })
-    .eq('id', tx.id);
 
-  // Подтверждаем заказ: аренда/покупка, из бокса/с доставкой — вся логика в lib/orders
+  // ⚠️ СНАЧАЛА ОБРАБАТЫВАЕМ ЗАКАЗ, ПОТОМ ОТМЕЧАЕМ ТРАНЗАКЦИЮ ЗАВЕРШЁННОЙ.
+  // Было наоборот: статус платежа ставился первым, и если дальше случался
+  // сбой, повторный запрос кассы видел «уже завершено» и возвращал успех —
+  // заказ при этом оставался неоплаченным, и восстановить его было нечем.
+  // В новом порядке незавершённая обработка просто повторится: confirmPayment
+  // идемпотентен (атомарный захват по paid_at).
   await orders.confirmPayment(tx.rental_id, {
     method: 'payme',
     paymentId: tx.paycom_id,
     amountSum: Math.round(Number(tx.amount) / 100),
   });
+
+  await supabase.from('payme_transactions')
+    .update({ state: STATE_COMPLETED, perform_time: performTime })
+    .eq('id', tx.id);
 
   return { result: { transaction: tx.id, perform_time: performTime, state: STATE_COMPLETED } };
 }
@@ -206,13 +212,29 @@ async function cancelTransaction(params) {
   // со стороны Payme) — заказ отменён, деньги уже вернулись (refund done), склад/ячейка обратно.
   // Завершённую аренду (инструмент уже возвращён) не трогаем.
   const rental = await getRental(tx.rental_id);
-  // Штраф: отмена НЕоплаченной транзакции счёт не закрывает (клиент попробует снова)
-  if (rental && rental.status !== 'completed' && !(rental.kind === 'penalty' && newState === STATE_CANCELLED)) {
+
+  // ⚠️ Отменяем заказ ТОЛЬКО если он оплачен этой же транзакцией или ещё не
+  // оплачен вовсе. Клиент мог открыть и Payme, и Click: одна касса платит,
+  // вторая отменяет свою неиспользованную попытку — и этот отказ обрушивал
+  // уже оплаченный заказ, освобождая ячейку и возвращая склад.
+  const paidByOther = rental
+    && rental.paid_at
+    && newState === STATE_CANCELLED          // неоплаченная попытка этой кассы
+    && rental.payment_provider !== 'payme';
+
+  if (rental && rental.status !== 'completed' && !paidByOther
+      && !(rental.kind === 'penalty' && newState === STATE_CANCELLED)) {
     const afterPay = newState === STATE_CANCELLED_AFTER;
-    await supabase.from('rentals').update({
+    // Та же защита от гонки, что и в общей отмене: пишем только поверх того
+    // состояния, которое проверяли.
+    const { data: changed } = await supabase.from('rentals').update({
       status: 'cancelled', cancelled_at: new Date().toISOString(),
       ...(afterPay ? { refund_status: 'done' } : {}),
-    }).eq('id', tx.rental_id);
+    }).eq('id', tx.rental_id).eq('status', rental.status).select('id');
+    if (!changed || !changed.length) {
+      console.warn('payme cancel: заказ изменился, отмену не применяем', tx.rental_id);
+      return { result: { transaction: tx.id, cancel_time: cancelTime, state: newState } };
+    }
     await orders.returnBonusById(tx.rental_id); // отмена транзакции — возвращаем и бонус
     if (afterPay && rental.kind === 'buy') await orders.returnStock(rental.tool_id);
     // Ячейку освобождаем только по самому заказу; вызов курьера (courier_return) ячейкой не владеет

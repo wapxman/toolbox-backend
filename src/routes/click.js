@@ -172,17 +172,19 @@ router.post('/complete', async (req, res) => {
     });
   }
 
-  // Подтверждаем оплату — как в Payme performTransaction
+  // Подтверждаем оплату — как в Payme performTransaction.
+  // ⚠️ Порядок важен: СНАЧАЛА заказ, потом отметка транзакции. Иначе сбой
+  // между ними оставлял заказ неоплаченным, а повторный запрос кассы видел
+  // «уже подтверждено» и возвращал успех, не доведя обработку до конца.
   const confirmTime = Date.now();
-  await supabase.from('click_transactions')
-    .update({ state: ST_CONFIRMED, confirm_time: confirmTime }).eq('id', tx.id);
-
-  // Подтверждаем заказ: аренда/покупка, из бокса/с доставкой — вся логика в lib/orders
   await orders.confirmPayment(tx.merchant_trans_id, {
     method: 'click',
     paymentId: String(tx.click_trans_id),
     amountSum: Math.round(Number(tx.amount)),
   });
+
+  await supabase.from('click_transactions')
+    .update({ state: ST_CONFIRMED, confirm_time: confirmTime }).eq('id', tx.id);
 
   return res.json({
     click_trans_id: p.click_trans_id,

@@ -31,7 +31,20 @@ async function auth(req, res, next) {
       return res.status(401).json({ error: 'Аккаунт удалён, войдите заново' });
     }
     if (user.is_blocked) {
-      return res.status(403).json({ error: 'Аккаунт заблокирован' });
+      // ⚠️ Блокировка не должна запирать человека вместе с нашим инструментом.
+      // Вернуть вещь, посмотреть свои заказы и оплатить долг он обязан иметь
+      // возможность — иначе инструмент остаётся у него, а штраф растёт.
+      // Запрещаем только новое: оформление заказов и прокрутку колеса.
+      const path = `${req.baseUrl || ''}${req.path || ''}`;
+      const allowedForBlocked =
+        /\/(return|return-courier|pay|payment-status|cancel)$/.test(path)
+        || /^\/api\/rentals\/(active|history)/.test(path)
+        || req.method === 'GET';
+      if (!allowedForBlocked) {
+        return res.status(403).json({
+          error: 'Аккаунт ограничен. Вернуть инструмент и оплатить счёт можно, новые заказы недоступны — обратитесь в поддержку.',
+        });
+      }
     }
   } catch (err) {
     // При сбое БД не роняем запрос целиком — дальше роут сам упадёт с понятной ошибкой

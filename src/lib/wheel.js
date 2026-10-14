@@ -46,17 +46,24 @@ const DEFAULTS = {
 const cache = { value: null, ts: 0 };
 async function getConfig() {
   if (cache.value && Date.now() - cache.ts < 60_000) return cache.value;
-  let value = DEFAULTS;
   try {
-    const { data } = await supabase.from('app_settings').select('value').eq('key', SETTINGS_KEY).maybeSingle();
-    if (data?.value) value = { ...DEFAULTS, ...data.value };
-  } catch {
-    // Настройки недоступны — работаем на умолчаниях, но НЕ молча: пусть видно в логе.
-    console.error('wheel: не прочитал app_settings, беру умолчания');
+    const { data, error } = await supabase
+      .from('app_settings').select('value').eq('key', SETTINGS_KEY).maybeSingle();
+    if (error) throw error;
+    const value = data?.value ? { ...DEFAULTS, ...data.value } : DEFAULTS;
+    cache.value = value;
+    cache.ts = Date.now();
+    return value;
+  } catch (e) {
+    // ⚠️ НЕ подставляем умолчания при сбое чтения. Владелец мог выключить
+    // акцию или сменить потолок скидки — а умолчания включают её обратно и
+    // возвращают прежний тариф. Если настройки когда-то читались, берём
+    // последние известные; если нет — честно падаем, а не раздаём призы по
+    // значениям из кода.
+    console.error('wheel: не прочитал app_settings —', e.message || e);
+    if (cache.value) return cache.value;
+    throw new Error('Настройки акции недоступны');
   }
-  cache.value = value;
-  cache.ts = Date.now();
-  return value;
 }
 const dropCache = () => { cache.value = null; cache.ts = 0; };
 
