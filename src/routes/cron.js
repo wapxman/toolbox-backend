@@ -5,6 +5,7 @@
 const express = require('express');
 const supabase = require('../lib/supabase');
 const orders = require('../lib/orders');
+const wheel = require('../lib/wheel');
 const notify = require('../lib/notify');
 const { refreshSmsStatuses } = require('../lib/sms');
 
@@ -72,7 +73,29 @@ router.get('/overdue', async (req, res) => {
     // по вине человека, и выигрыш сгорать за это не должен.
     for (const r of stale || []) await orders.returnBonusById(r.id);
 
-    // 4) Статусы SMS. Eskiz при отправке отвечает «waiting»; доставлено или
+    // 4) Бонус скоро сгорит — напоминаем. Срок виден на экранах, но человек
+    //    в приложение не заходит, и выигрыш сгорает молча: мы подарили, он не
+    //    узнал. Ключ дедупликации с датой сгорания — напомним один раз на
+    //    начисление, а не каждый день подряд.
+    let bonusWarned = 0;
+    try {
+      const soon = await wheel.expiringSoon(3);
+      for (const b of soon) {
+        const left = Math.max(0, Math.ceil((b.expiresAt - Date.now()) / 86400000));
+        const when = left <= 0 ? 'сегодня' : left === 1 ? 'завтра' : `через ${left} дн.`;
+        await orders.notifyUser(
+          b.userId, null, 'info', 'Бонус скоро сгорит',
+          `${orders.fmt(b.amount)} сум на аренду сгорают ${when}. Успейте потратить.`,
+          { event: 'bonus.expiring', dedupeKey: `bonus.expiring:${b.userId}:${b.expiresAt.toISOString().slice(0, 10)}` },
+        );
+        bonusWarned++;
+      }
+    } catch (e) {
+      // Напоминание — не повод ронять весь крон: просрочки важнее.
+      console.error('[CRON overdue] напоминание о бонусе не ушло:', e.message);
+    }
+
+    // 5) Статусы SMS. Eskiz при отправке отвечает «waiting»; доставлено или
     //    отбито оператором — выясняется позже. Сбой сверки не должен ронять крон.
     let sms = { updated: 0 };
     try {
@@ -81,8 +104,8 @@ router.get('/overdue', async (req, res) => {
       console.error('sms status refresh failed:', e.message);
     }
 
-    console.log(`[CRON overdue] помечено: ${marked}, брошенных отменено: ${(stale || []).length}, ячеек исправлено: ${fixedCells.length}, статусов SMS обновлено: ${sms.updated}`);
-    res.json({ ok: true, marked, stale_cancelled: (stale || []).length, cells_fixed: fixedCells, sms_statuses_updated: sms.updated });
+    console.log(`[CRON overdue] бонусных напоминаний: ${bonusWarned}, помечено: ${marked}, брошенных отменено: ${(stale || []).length}, ячеек исправлено: ${fixedCells.length}, статусов SMS обновлено: ${sms.updated}`);
+    res.json({ ok: true, marked, bonus_warned: bonusWarned, stale_cancelled: (stale || []).length, cells_fixed: fixedCells, sms_statuses_updated: sms.updated });
   } catch (err) {
     console.error('cron overdue error:', err);
     res.status(500).json({ error: 'cron failed' });

@@ -398,6 +398,59 @@ async function claimFor(userId, deviceId) {
   return { claimed, amount: total };
 }
 
+/** Кому пора напомнить, что бонус скоро сгорит.
+ *
+ *  Срок виден на экранах, но человек в приложение не заходит — и выигрыш
+ *  сгорает молча. Это худший исход для акции: мы подарили, он не узнал.
+ *
+ *  Берём начисления, которые сгорают в ближайшие [days] суток и ещё не
+ *  потрачены целиком. Возвращает [{ userId, amount, expiresAt }].
+ */
+async function expiringSoon(days = 3) {
+  const now = new Date();
+  const until = new Date(now.getTime() + days * 86400_000);
+
+  const { data: credits, error } = await supabase
+    .from('wallet_entries')
+    .select('id, user_id, amount, expires_at')
+    .gt('amount', 0)
+    .is('parent_id', null)          // только начисления, не возвраты
+    .not('expires_at', 'is', null)
+    .gt('expires_at', now.toISOString())
+    .lte('expires_at', until.toISOString());
+  if (error) throw new Error('не удалось найти сгорающие бонусы: ' + error.message);
+  if (!credits || !credits.length) return [];
+
+  // Сколько с каждого начисления уже потрачено: напоминать о нуле незачем.
+  const ids = credits.map((c) => c.id);
+  const { data: spent } = await supabase
+    .from('wallet_entries')
+    .select('parent_id, amount')
+    .in('parent_id', ids);
+
+  const used = new Map();
+  for (const s of spent || []) {
+    used.set(s.parent_id, (used.get(s.parent_id) || 0) + Number(s.amount)); // отрицательное
+  }
+
+  // Складываем остатки по человеку: у него может быть несколько начислений.
+  const byUser = new Map();
+  for (const c of credits) {
+    const left = Number(c.amount) + (used.get(c.id) || 0);
+    if (left <= 0) continue;
+    const cur = byUser.get(c.user_id);
+    const expiresAt = new Date(c.expires_at);
+    if (cur) {
+      cur.amount += left;
+      // Напоминаем по самому раннему сроку — он и есть крайний.
+      if (expiresAt < cur.expiresAt) cur.expiresAt = expiresAt;
+    } else {
+      byUser.set(c.user_id, { userId: c.user_id, amount: left, expiresAt });
+    }
+  }
+  return [...byUser.values()];
+}
+
 /** Списать бонус под заказ. Списание ссылается на конкретные начисления
  *  (parent_id), поэтому сгоревшее начисление уносит свои траты с собой. */
 async function spend(userId, rentalId, amount) {
@@ -483,5 +536,6 @@ async function refund(userId, rentalId) {
 module.exports = {
   DEFAULTS, SETTINGS_KEY, getConfig, dropCache,
   balanceOf, applicable, drawPrize, layoutSectors,
-  winnersCount, promoState, accountChain, spinsLeft, spin, claimFor, spend, refund,
+  winnersCount, promoState, accountChain, spinsLeft, spin, claimFor,
+  expiringSoon, spend, refund,
 };
