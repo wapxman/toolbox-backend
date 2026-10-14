@@ -438,23 +438,40 @@ async function spend(userId, rentalId, amount) {
   return amount - rest;
 }
 
-/** Вернуть списанное при отмене заказа. */
+/** Вернуть списанное при отмене заказа.
+ *
+ *  ⚠️ ИДЕМПОТЕНТНО. Заказ отменяется из нескольких мест (пользователь, админ,
+ *  крон брошенных, отмена транзакции в Payme и Click), и один заказ вполне
+ *  может быть отменён дважды подряд. Без сверки с уже сделанными возвратами
+ *  человек получал бы бонус заново при каждом вызове — из воздуха.
+ */
 async function refund(userId, rentalId) {
-  const { data: spends } = await supabase
+  const { data: moves } = await supabase
     .from('wallet_entries')
-    .select('id, amount, parent_id')
+    .select('id, amount, kind, parent_id')
     .eq('user_id', userId)
-    .eq('rental_id', rentalId)
-    .eq('kind', 'rent_spend');
+    .eq('rental_id', rentalId);
+
+  // Считаем ПО СУММЕ на каждое начисление, а не по отдельным записям: по
+  // одному начислению в заказе может быть несколько списаний, и сопоставлять
+  // их с возвратами поштучно значит рано или поздно ошибиться.
+  const net = new Map(); // parent_id -> сколько ещё должны вернуть
+  for (const m of moves || []) {
+    if (m.kind !== 'rent_spend' && m.kind !== 'refund') continue;
+    // rent_spend отрицателен, refund положителен: сумма по начислению и есть
+    // невозвращённый остаток со знаком минус.
+    net.set(m.parent_id, (net.get(m.parent_id) || 0) + Number(m.amount));
+  }
+
   let total = 0;
-  for (const s of spends || []) {
-    const back = -Number(s.amount);
-    if (back <= 0) continue;
+  for (const [parentId, sum] of net) {
+    const back = -sum;
+    if (back <= 0) continue; // по этому начислению уже всё вернули
     await supabase.from('wallet_entries').insert({
       user_id: userId,
       amount: back,
       kind: 'refund',
-      parent_id: s.parent_id,
+      parent_id: parentId,
       rental_id: rentalId,
       note: 'Возврат при отмене заказа',
     });

@@ -81,6 +81,7 @@ async function expireIfNeeded(tx) {
       .eq('id', tx.rental_id)
       .eq('status', 'pending_payment')
       .neq('kind', 'penalty'); // штраф не аннулируется по таймауту транзакции
+    await orders.returnBonusById(tx.rental_id); // бонус не должен сгореть по таймауту
     return { ...tx, state: STATE_CANCELLED, reason: 4, cancel_time: cancelTime };
   }
   return tx;
@@ -212,6 +213,7 @@ async function cancelTransaction(params) {
       status: 'cancelled', cancelled_at: new Date().toISOString(),
       ...(afterPay ? { refund_status: 'done' } : {}),
     }).eq('id', tx.rental_id);
+    await orders.returnBonusById(tx.rental_id); // отмена транзакции — возвращаем и бонус
     if (afterPay && rental.kind === 'buy') await orders.returnStock(rental.tool_id);
     // Ячейку освобождаем только по самому заказу; вызов курьера (courier_return) ячейкой не владеет
     if (rental?.tools?.cells && rental.kind === 'rent') {

@@ -341,6 +341,27 @@ async function returnBonus(rental) {
   }
 }
 
+/** Вернуть бонус по id заказа — для путей отмены, где самого заказа под рукой
+ *  нет: крон брошенных, отмена транзакции в Payme и Click.
+ *
+ *  ⚠️ Эти пути меняют статус напрямую, мимо cancelOrder, и до появления этой
+ *  функции бонус у них просто сгорал: заказ отменён, деньги не вернулись.
+ *  Повторный вызов безопасен — wheel.refund сверяется с уже возвращённым.
+ */
+async function returnBonusById(rentalId) {
+  if (!rentalId) return;
+  try {
+    const { data } = await supabase
+      .from('rentals')
+      .select('id, user_id, bonus_applied')
+      .eq('id', rentalId)
+      .maybeSingle();
+    await returnBonus(data);
+  } catch (e) {
+    console.error('bonus refund by id error:', rentalId, e);
+  }
+}
+
 // Отмена заказа. Возвращает {ok, refund_required} или {error}.
 async function cancelOrder(rental, by = 'user') {
   if (!rental) return { error: 'Заказ не найден' };
@@ -395,6 +416,6 @@ module.exports = {
   getPricing, getDelivery, getSupport, getTerms, calculatePrice, overdueFeeFor, availableSlots, resolveSlot,
   createPenalty, unpaidPenalties,
   RENTAL_FULL, loadRental, openLock, cellOf, openCellFor, notifyUser, notifyAdmin,
-  takeStock, returnStock, confirmPayment, pickupPurchase, cancelOrder,
+  takeStock, returnStock, confirmPayment, pickupPurchase, cancelOrder, returnBonusById,
   describe, addressLine, fmt,
 };

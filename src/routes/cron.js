@@ -68,6 +68,10 @@ router.get('/overdue', async (req, res) => {
       .lt('created_at', dayAgo)
       .select('id');
 
+    // Бонус, ушедший в брошенный заказ, возвращаем на счёт: заказ отменён не
+    // по вине человека, и выигрыш сгорать за это не должен.
+    for (const r of stale || []) await orders.returnBonusById(r.id);
+
     // 4) Статусы SMS. Eskiz при отправке отвечает «waiting»; доставлено или
     //    отбито оператором — выясняется позже. Сбой сверки не должен ронять крон.
     let sms = { updated: 0 };
