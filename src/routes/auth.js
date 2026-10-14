@@ -97,20 +97,28 @@ router.post('/verify', async (req, res) => {
     const isReviewer = isReviewLogin(phone, code);
 
     if (!isDevMaster && !isReviewer) {
-      const { data: stored } = await supabase
-        .from('sms_codes')
-        .select('code, expires_at')
-        .eq('phone', phone)
-        .single();
-
-      if (!stored || stored.code !== code) {
+      // ⚠️ Проверку кода делает база одной транзакцией (sms_verify_code):
+      // она же считает неверные попытки. Код четырёхзначный, 9000 вариантов,
+      // живёт пять минут — без счётчика его просто перебирают и входят в чужой
+      // аккаунт. Ограничение на отправку SMS от этого не защищает: оно
+      // ограничивает выдачу кода, а не количество попыток его угадать.
+      const { data, error: vErr } = await supabase.rpc('sms_verify_code', {
+        p_phone: phone, p_code: String(code), max_attempts: 5,
+      });
+      if (vErr) {
+        console.error('verify code error:', vErr);
+        return res.status(500).json({ error: 'Не удалось проверить код' });
+      }
+      const v = Array.isArray(data) ? data[0] : data;
+      if (!v || !v.ok) {
+        if (v && v.reason === 'expired') {
+          return res.status(401).json({ error: 'Код истёк, запросите новый' });
+        }
+        if (v && v.reason === 'too_many') {
+          return res.status(429).json({ error: 'Слишком много попыток. Запросите новый код' });
+        }
         return res.status(401).json({ error: 'Неверный код' });
       }
-      if (Date.now() > new Date(stored.expires_at).getTime()) {
-        await supabase.from('sms_codes').delete().eq('phone', phone);
-        return res.status(401).json({ error: 'Код истёк, запросите новый' });
-      }
-      await supabase.from('sms_codes').delete().eq('phone', phone);
     }
 
     // Ищем или создаём пользователя

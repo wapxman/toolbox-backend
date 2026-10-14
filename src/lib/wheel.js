@@ -350,7 +350,7 @@ async function claimFor(userId, deviceId) {
 
   const { data: rows, error } = await supabase
     .from('wheel_spins')
-    .select('id, prize_label, amount, kind')
+    .select('id')
     .eq('device_id', deviceId)
     .is('user_id', null)
     .is('claimed_at', null)
@@ -364,35 +364,23 @@ async function claimFor(userId, deviceId) {
   let claimed = 0;
   let total = 0;
   for (const row of rows || []) {
-    let walletEntryId = null;
-    if (row.kind === 'bonus' && Number(row.amount) > 0) {
-      const expires = new Date(Date.now() + Number(cfg.expires_days || 30) * 86400_000).toISOString();
-      const { data, error: insErr } = await supabase
-        .from('wallet_entries')
-        .insert({
-          user_id: userId,
-          amount: Number(row.amount),
-          kind: 'wheel_win',
-          expires_at: expires,
-          note: `Колесо Фортуны: ${row.prize_label}`,
-        })
-        .select('id')
-        .single();
-      if (insErr) throw new Error('не удалось начислить выигрыш: ' + insErr.message);
-      walletEntryId = data.id;
-      total += Number(row.amount);
-    }
+    // ⚠️ Захват и начисление — одной транзакцией в базе (wheel_claim_spin).
+    // Раньше начисление создавалось ПЕРЕД закреплением выигрыша, а закрепление
+    // с условием `claimed_at is null` при проигрыше гонки меняло ноль строк и
+    // НЕ возвращало ошибку: начисление оставалось. Два одновременных «Забрать
+    // приз» давали двойной бонус из воздуха.
+    const { data, error: rpcErr } = await supabase.rpc('wheel_claim_spin', {
+      uid: userId,
+      spin: row.id,
+      days_valid: Number(cfg.expires_days || 30),
+    });
+    if (rpcErr) throw new Error('не удалось забрать выигрыш: ' + rpcErr.message);
 
-    const { error: updErr } = await supabase
-      .from('wheel_spins')
-      .update({ user_id: userId, wallet_entry_id: walletEntryId, claimed_at: new Date().toISOString() })
-      .eq('id', row.id)
-      .is('claimed_at', null); // гонка двух входов: второй не перезапишет
-    if (updErr) {
-      if (walletEntryId) await supabase.from('wallet_entries').delete().eq('id', walletEntryId);
-      throw new Error('не удалось закрепить выигрыш: ' + updErr.message);
+    const res = Array.isArray(data) ? data[0] : data;
+    if (res && Number(res.claimed) > 0) {
+      claimed++;
+      total += Number(res.amount || 0);
     }
-    claimed++;
   }
 
   return { claimed, amount: total };
@@ -455,40 +443,14 @@ async function expiringSoon(days = 3) {
  *  (parent_id), поэтому сгоревшее начисление уносит свои траты с собой. */
 async function spend(userId, rentalId, amount) {
   if (!(amount > 0)) return 0;
-
-  const { data: credits, error } = await supabase
-    .from('wallet_entries')
-    .select('id, amount, expires_at, created_at')
-    .eq('user_id', userId)
-    .gt('amount', 0)
-    .order('expires_at', { ascending: true, nullsFirst: false });
-  if (error) throw new Error('не удалось прочитать кошелёк: ' + error.message);
-
-  const now = Date.now();
-  let rest = amount;
-  for (const c of credits || []) {
-    if (rest <= 0) break;
-    if (c.expires_at && new Date(c.expires_at).getTime() <= now) continue;
-    const { data: used } = await supabase
-      .from('wallet_entries')
-      .select('amount')
-      .eq('parent_id', c.id);
-    const spentOnIt = (used || []).reduce((s, r) => s + Number(r.amount), 0); // отрицательное
-    const left = Number(c.amount) + spentOnIt;
-    if (left <= 0) continue;
-    const take = Math.min(left, rest);
-    const { error: insErr } = await supabase.from('wallet_entries').insert({
-      user_id: userId,
-      amount: -take,
-      kind: 'rent_spend',
-      parent_id: c.id,
-      rental_id: rentalId,
-      note: 'Списано на заказ',
-    });
-    if (insErr) throw new Error('не удалось списать бонус: ' + insErr.message);
-    rest -= take;
-  }
-  return amount - rest;
+  // ⚠️ Списание идёт одной транзакцией в базе (wallet_spend): начисления там
+  // берутся под блокировку. Раньше остаток читался отдельным запросом, и два
+  // одновременных заказа видели одни и те же деньги — бонус уходил дважды.
+  const { data, error } = await supabase.rpc('wallet_spend', {
+    uid: userId, rid: rentalId, want: Math.floor(amount),
+  });
+  if (error) throw new Error('не удалось списать бонус: ' + error.message);
+  return Number(data || 0);
 }
 
 /** Вернуть списанное при отмене заказа.
@@ -499,38 +461,16 @@ async function spend(userId, rentalId, amount) {
  *  человек получал бы бонус заново при каждом вызове — из воздуха.
  */
 async function refund(userId, rentalId) {
-  const { data: moves } = await supabase
-    .from('wallet_entries')
-    .select('id, amount, kind, parent_id')
-    .eq('user_id', userId)
-    .eq('rental_id', rentalId);
-
-  // Считаем ПО СУММЕ на каждое начисление, а не по отдельным записям: по
-  // одному начислению в заказе может быть несколько списаний, и сопоставлять
-  // их с возвратами поштучно значит рано или поздно ошибиться.
-  const net = new Map(); // parent_id -> сколько ещё должны вернуть
-  for (const m of moves || []) {
-    if (m.kind !== 'rent_spend' && m.kind !== 'refund') continue;
-    // rent_spend отрицателен, refund положителен: сумма по начислению и есть
-    // невозвращённый остаток со знаком минус.
-    net.set(m.parent_id, (net.get(m.parent_id) || 0) + Number(m.amount));
-  }
-
-  let total = 0;
-  for (const [parentId, sum] of net) {
-    const back = -sum;
-    if (back <= 0) continue; // по этому начислению уже всё вернули
-    await supabase.from('wallet_entries').insert({
-      user_id: userId,
-      amount: back,
-      kind: 'refund',
-      parent_id: parentId,
-      rental_id: rentalId,
-      note: 'Возврат при отмене заказа',
-    });
-    total += back;
-  }
-  return total;
+  if (!userId || !rentalId) return 0;
+  // ⚠️ Возврат тоже одной транзакцией (wallet_refund_rental). Прежняя версия
+  // читала уже возвращённое и писала сторно отдельно: два параллельных
+  // возврата одного заказа возвращали двойную сумму, а неудачная вставка
+  // молча считалась успехом.
+  const { data, error } = await supabase.rpc('wallet_refund_rental', {
+    uid: userId, rid: rentalId,
+  });
+  if (error) throw new Error('не удалось вернуть бонус: ' + error.message);
+  return Number(data || 0);
 }
 
 module.exports = {

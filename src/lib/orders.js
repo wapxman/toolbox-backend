@@ -204,9 +204,30 @@ async function returnStock(toolId) {
 async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
   const rental = await loadRental(rentalId);
   if (!rental) return null;
-  if (rental.status !== 'pending_payment') return rental; // идемпотентность: уже подтверждали
+  if (rental.status !== 'pending_payment') return rental; // быстрый выход: уже обработан
+
   const now = new Date();
   const nowIso = now.toISOString();
+
+  // ⚠️ АТОМАРНЫЙ ЗАХВАТ ПРАВА ОБРАБОТАТЬ ПЛАТЁЖ. Проверка статуса выше — не
+  // блокировка: два обработчика кассы (или Payme и Click одновременно) успевали
+  // прочитать `pending_payment` оба и оба выполняли выдачу, списание склада и
+  // открытие замка. Здесь же условие проверяет сама база одной операцией:
+  // кто первым проставил paid_at — тот и обрабатывает, второй уходит ни с чем.
+  const { data: claimed, error: claimErr } = await supabase
+    .from('rentals')
+    .update({ paid_at: nowIso })
+    .eq('id', rentalId)
+    .eq('status', 'pending_payment')
+    .is('paid_at', null)
+    .select('id');
+  if (claimErr) throw new Error('не удалось зафиксировать оплату: ' + claimErr.message);
+  if (!claimed || !claimed.length) {
+    // Гонку проиграли — заказ уже обрабатывает кто-то другой. Платёж при этом
+    // не теряем: он записан в transactions ниже по общему пути повторного
+    // вызова, а состояние заказа менять второй раз нельзя.
+    return await loadRental(rentalId);
+  }
 
   await supabase.from('transactions').insert({
     rental_id: rentalId, user_id: rental.user_id,
@@ -226,6 +247,38 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
     await notifyUser(rental.user_id, rentalId, 'payment', 'Штраф оплачен',
       `${paidText} Спасибо — новые аренды снова доступны.`, paidKey('user'));
     return rental;
+  }
+
+  // 0.1) Оплата продления: только теперь двигаем срок родительской аренды.
+  // До оплаты счёт висит отдельным заказом, а аренда живёт со старым сроком —
+  // иначе инструментом пользуются дольше оплаченного.
+  if (rental.kind === 'extension') {
+    const extraDays = Number(rental.days || 0);
+    const { data: parent } = await supabase
+      .from('rentals')
+      .select('id, days, expected_end, status, order_number, tools(name)')
+      .eq('id', rental.parent_rental_id)
+      .single();
+
+    if (parent) {
+      // Отсчитываем от большей из двух дат: если срок уже вышел, продление
+      // должно давать дни от сегодня, а не задним числом закрывать просрочку.
+      const base = new Date(Math.max(new Date(parent.expected_end).getTime(), now.getTime()));
+      const newEnd = new Date(base.getTime() + extraDays * 86400_000);
+      await supabase.from('rentals').update({
+        days: Number(parent.days || 0) + extraDays,
+        expected_end: newEnd.toISOString(),
+        // Просрочка снимается только потому, что срок действительно оплачен.
+        status: parent.status === 'overdue' ? 'active' : parent.status,
+      }).eq('id', parent.id);
+    }
+
+    await supabase.from('rentals')
+      .update({ status: 'completed', paid_at: nowIso, actual_end: nowIso })
+      .eq('id', rentalId);
+    await notifyUser(rental.user_id, rental.parent_rental_id || rentalId, 'payment', 'Аренда продлена',
+      `${paidText} Срок увеличен на ${extraDays} дн.`, paidKey('user'));
+    return await loadRental(rentalId);
   }
 
   // 1) Вызов курьера за арендованным инструментом

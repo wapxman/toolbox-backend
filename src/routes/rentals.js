@@ -426,52 +426,84 @@ router.post('/:id/extend', async (req, res) => {
       return res.status(400).json({ error: 'Аренда не активна — продление невозможно' });
     }
 
-    const newDays = rental.days + extra_days;
+    // ⚠️ СРОК МЕНЯЕТСЯ ТОЛЬКО ПОСЛЕ ОПЛАТЫ. Раньше продление сразу двигало
+    // expected_end и увеличивало total_price, а доплата оставалась числом в
+    // уведомлении: человек пользовался инструментом дольше, ничего не заплатив,
+    // и мог так же отодвигать уже начавшуюся просрочку. Теперь продление — это
+    // отдельный счёт, как штраф; аренду продлевает confirmPayment после денег.
     const extraPrice = calculatePrice(rental.tools.day_price, extra_days, await getPricing());
-    const newEnd = new Date(rental.expected_end);
-    newEnd.setDate(newEnd.getDate() + extra_days);
 
-    // Бонус работает и при продлении: иначе выходит, что на первый заказ
-    // скидка есть, а на те же дни, взятые продлением, — нет. Потолок считается
-    // от доплаты: это та же стоимость товара, только за добавленные дни.
+    // Бонус работает и здесь: потолок считается от доплаты. Списываем сразу —
+    // счёт уже выставлен на уменьшенную сумму, а при отмене счёта бонус
+    // вернётся общим путём возврата.
     const wheelCfg = await wheel.getConfig();
     const bonusBalance = await wheel.balanceOf(req.userId);
     let bonusCut = wheel.applicable(bonusBalance, extraPrice, Number(wheelCfg.max_pay_pct || 50));
+
+    const existing = await supabase
+      .from('rentals')
+      .select('id, order_number, total_price')
+      .eq('parent_rental_id', rental.id)
+      .eq('kind', 'extension')
+      .eq('status', 'pending_payment')
+      .maybeSingle();
+    if (existing.data) {
+      return res.status(400).json({
+        error: `Счёт на продление уже выставлен (№${existing.data.order_number}). Оплатите его в разделе «Заказы».`,
+        rental_id: existing.data.id,
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    const { data: bill, error: billErr } = await supabase
+      .from('rentals')
+      .insert({
+        user_id: req.userId,
+        tool_id: rental.tool_id,
+        kind: 'extension',
+        fulfillment: 'pickup',
+        parent_rental_id: rental.id,
+        days: extra_days,              // сколько дней добавить родительской аренде
+        started_at: nowIso,
+        expected_end: nowIso,
+        status: 'pending_payment',
+        items_price: extraPrice,
+        discount: 0,
+        delivery_fee: 0,
+        bonus_applied: 0,
+        total_price: extraPrice,
+        payment_provider: rental.payment_provider || 'payme',
+        terms_version: String((await orders.getTerms()).version),
+      })
+      .select()
+      .single();
+    if (billErr) throw billErr;
+
     if (bonusCut > 0) {
       try {
-        bonusCut = await wheel.spend(req.userId, rental.id, bonusCut);
+        bonusCut = await wheel.spend(req.userId, bill.id, bonusCut);
       } catch (e) {
-        // Продление важнее скидки: не списалось — продлеваем за полную цену.
         console.error('bonus spend on extend error:', e);
         bonusCut = 0;
       }
+      if (bonusCut > 0) {
+        await supabase.from('rentals')
+          .update({ bonus_applied: bonusCut, total_price: extraPrice - bonusCut })
+          .eq('id', bill.id);
+        bill.bonus_applied = bonusCut;
+        bill.total_price = extraPrice - bonusCut;
+      }
     }
-    const toPay = extraPrice - bonusCut;
 
-    const { data: updated, error: uErr } = await supabase
-      .from('rentals')
-      .update({
-        days: newDays,
-        expected_end: newEnd.toISOString(),
-        total_price: rental.total_price + toPay,
-        bonus_applied: (rental.bonus_applied || 0) + bonusCut,
-        status: 'active',
-      })
-      .eq('id', req.params.id)
-      .select()
-      .single();
-    if (uErr) throw uErr;
+    await orders.notifyUser(req.userId, bill.id, 'payment', 'Счёт на продление',
+      `${rental.tools.name} — +${extra_days} дн. Доплата ${bill.total_price.toLocaleString('ru-RU')} сум`
+      + (bonusCut > 0 ? ` (бонусом покрыто ${bonusCut.toLocaleString('ru-RU')})` : '')
+      + '. Срок продлится после оплаты.',
+      { event: 'extension.created', dedupeKey: `extension.created:${bill.id}` });
 
-    await orders.notifyUser(req.userId, rental.id, 'payment', 'Аренда продлена',
-      `${rental.tools.name} — +${extra_days} дн., доплата ${toPay.toLocaleString('ru-RU')} сум`
-      + (bonusCut > 0 ? ` (бонусом покрыто ${bonusCut.toLocaleString('ru-RU')})` : ''),
-      { event: 'rental.extended' }); // продлевать можно много раз — ключ не фиксируем
-    res.json({
-      rental: updated,
-      extra_price: toPay,
-      bonus_applied: bonusCut,
-      message: `Аренда продлена на ${extra_days} дн.`,
-    });
+    const tool = { name: rental.tools.name };
+    return paymentResponse(res, bill, tool, bill.payment_provider, req.userId,
+      `Счёт на продление создан. Оплатите — и срок увеличится на ${extra_days} дн.`);
   } catch (err) {
     console.error('extend error:', err);
     res.status(500).json({ error: 'Ошибка продления' });
