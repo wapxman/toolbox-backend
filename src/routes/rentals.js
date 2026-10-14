@@ -531,7 +531,15 @@ router.post('/:id/return', async (req, res) => {
 
     const cell = rental.tools.cells;
     const zoneId = cell.boxes.kerong_zone_id || 1;
-    const lockNumber = cell.kerong_lock_number ?? (cell.cell_number - 1);
+    // Номер замка только явный: «номер ячейки минус один» — догадка, при
+    // расхождении нумерации откроется чужая ячейка.
+    const lockNumber = cell.kerong_lock_number;
+    if (lockNumber == null) {
+      return res.status(503).json({
+        error: 'Ячейка не настроена для открытия. Обратитесь в поддержку — аренда останется активной.',
+        lock_failed: true,
+      });
+    }
     try {
       await kerong.openLock(zoneId, lockNumber);
     } catch (lockErr) {
@@ -554,7 +562,11 @@ router.post('/:id/return', async (req, res) => {
       .single();
     if (uErr) throw uErr;
 
-    await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+    // ⚠️ Ячейка НЕ становится свободной сама. Мы знаем лишь то, что замок
+    // открылся, — положили ли инструмент, система не видит. Раньше ячейка
+    // освобождалась сразу, и следующий клиент оплачивал аренду пустой ячейки.
+    // Теперь она ждёт проверки сотрудником.
+    await supabase.from('cells').update({ status: 'pending_check' }).eq('id', rental.tools.cell_id);
     const penalty = overdueFee > 0 ? await orders.createPenalty({ ...rental, order_number: updated.order_number }, overdueFee) : null;
     await orders.notifyUser(req.userId, rental.id, 'info',
       overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',

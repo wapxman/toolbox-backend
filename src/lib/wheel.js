@@ -218,9 +218,14 @@ async function spinsLeft(owner, cfg) {
 /** Сколько призов уже разыграно. Нужно, чтобы остановить акцию на обещанном
  *  числе победителей: объявили тысячу — значит тысяча, а не сколько придёт. */
 async function winnersCount() {
+  // ⚠️ Считаем ТОЛЬКО призы с владельцем. Незабранные гостевые прокрутки в
+  // счёт не идут: иначе человек с десятком меток устройства выбирает себе
+  // выигрыш поудобнее, а остальные его прокрутки съедают лимит кампании —
+  // акция закрывается для настоящих клиентов, ничего им не отдав.
   const { count, error } = await supabase
     .from('wheel_spins')
     .select('id', { count: 'exact', head: true })
+    .not('user_id', 'is', null)
     .neq('status', 'cancelled');
   if (error) throw new Error('не удалось посчитать победителей: ' + error.message);
   return Number(count || 0);
@@ -279,6 +284,25 @@ async function spin(owner) {
 
   const left = await spinsLeft({ userId, deviceId }, cfg);
   if (left <= 0) { const e = new Error('Вы уже использовали свою попытку'); e.code = 'no_spins'; throw e; }
+
+  // ⚠️ Гость с НЕЗАБРАННЫМ выигрышем второй раз не крутит. Метку устройства
+  // присылает телефон, подделать её ничего не стоит, но вместе с правилом
+  // «один незабранный приз на устройство» перебор перестаёт быть выгодным:
+  // чтобы крутить снова, прежний приз надо сначала забрать — то есть
+  // зарегистрироваться, а там уже действует лимит на аккаунт.
+  if (!userId && deviceId) {
+    const { count: pending } = await supabase
+      .from('wheel_spins')
+      .select('id', { count: 'exact', head: true })
+      .eq('device_id', deviceId)
+      .is('user_id', null)
+      .neq('status', 'cancelled');
+    if (Number(pending || 0) > 0) {
+      const e = new Error('Ваш выигрыш уже ждёт — зарегистрируйтесь, чтобы забрать его');
+      e.code = 'no_spins';
+      throw e;
+    }
+  }
 
   const prize = drawPrize(cfg.prizes);
   if (!prize) { const e = new Error('Призы не настроены'); e.code = 'no_prizes'; throw e; }

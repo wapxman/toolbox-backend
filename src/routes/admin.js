@@ -161,6 +161,34 @@ router.patch('/orders/:id', async (req, res) => {
         return res.json({ ok: true });
       }
 
+      // Приёмка возврата: сотрудник подтвердил, что инструмент действительно
+      // лежит в ячейке. До этого ячейка в pending_check и никому не выдаётся —
+      // открытие замка не доказывает, что инструмент положили.
+      case 'return_verified': {
+        const cellId = rental.kind === 'buy' ? rental.pickup_cell_id : rental.tools?.cell_id;
+        if (!cellId) return res.status(400).json({ error: 'У заказа нет ячейки' });
+        const { data: cell } = await supabase
+          .from('cells').select('id, status').eq('id', cellId).single();
+        if (!cell || cell.status !== 'pending_check') {
+          return res.status(400).json({ error: 'Эта ячейка не ждёт проверки' });
+        }
+        await supabase.from('cells').update({ status: 'free' }).eq('id', cellId);
+        return res.json({ ok: true });
+      }
+
+      // Инструмент НЕ вернули: ячейка освобождается, но инструмент помечен
+      // отсутствующим — выдавать его нельзя, пока не разберутся.
+      case 'return_missing': {
+        const cellId = rental.kind === 'buy' ? rental.pickup_cell_id : rental.tools?.cell_id;
+        if (!cellId) return res.status(400).json({ error: 'У заказа нет ячейки' });
+        await supabase.from('cells').update({ status: 'maintenance' }).eq('id', cellId);
+        await supabase.from('tools').update({ status: 'maintenance' }).eq('id', rental.tool_id);
+        await orders.notifyAdmin(
+          `🚨 Инструмент не найден в ячейке по заказу №${rental.order_number} — ячейка и инструмент выведены из оборота`,
+          once('return.missing'));
+        return res.json({ ok: true });
+      }
+
       case 'refunded': {
         if (rental.refund_status !== 'pending') return res.status(400).json({ error: 'Возврат денег не ожидается' });
         await upd({ refund_status: 'done' });

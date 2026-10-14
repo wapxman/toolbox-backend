@@ -110,6 +110,12 @@ async function openLock(zoneId, lockNumber) {
   console.log(`[KERONG] Открываем замок #${lockNumber} (зона ${zoneId})`);
 
   if (MOCK_MODE) {
+    // ⚠️ На продакшене заглушка недопустима: она возвращала «успех», и клиент
+    // получал активную аренду при запертой ячейке. Пустой KERONG_LCS_URL в
+    // боевом окружении — это поломка настроек, а не режим работы.
+    if (process.env.VERCEL_ENV === 'production' || process.env.NODE_ENV === 'production') {
+      throw new Error('Замки не настроены (KERONG_LCS_URL пуст) — открытие невозможно');
+    }
     console.log(`[KERONG MOCK] Замок #${lockNumber} открыт (мок)`);
     return { success: true, mock: true };
   }

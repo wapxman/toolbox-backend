@@ -150,8 +150,14 @@ async function loadRental(id) {
 
 async function openLock(cell) {
   const zoneId = cell?.boxes?.kerong_zone_id || 1;
-  const lockNumber = cell?.kerong_lock_number ?? (cell?.cell_number != null ? cell.cell_number - 1 : null);
-  if (lockNumber == null) throw new Error('Нет номера замка');
+  // ⚠️ Номер замка берём ТОЛЬКО из явного поля. Прежний запасной вариант
+  // «номер ячейки минус один» — догадка: стоит нумерации ячеек разойтись с
+  // разводкой платы, и откроется чужая ячейка с чужим инструментом. Нет
+  // настроенного номера — honest отказ и зов оператора, а не случайный замок.
+  const lockNumber = cell?.kerong_lock_number;
+  if (lockNumber == null) {
+    throw new Error(`Для ячейки ${cell?.cell_number ?? '?'} не задан номер замка (kerong_lock_number)`);
+  }
   await kerong.openLock(zoneId, lockNumber);
 }
 // Ячейка заказа: для покупки с самовывозом — pickup_cell, иначе ячейка арендного экземпляра
@@ -187,17 +193,29 @@ function deliveryBlock(r) {
 // --- Склад новых единиц ---
 // Списать одну единицу; вернёт true, если остаток был > 0.
 async function takeStock(toolId) {
-  const { data: t } = await supabase.from('tools').select('sale_stock').eq('id', toolId).single();
-  const stock = Number(t?.sale_stock || 0);
-  if (stock <= 0) return false;
-  const { data } = await supabase.from('tools').update({ sale_stock: stock - 1 })
-    .eq('id', toolId).eq('sale_stock', stock).select('id'); // optimistic lock
-  if (!data || !data.length) return takeStock(toolId);        // гонка — повторим
-  return true;
+  // ⚠️ Одной операцией в базе. Прежняя версия читала остаток, писала остаток-1
+  // и при гонке вызывала себя заново — без ограничения глубины, то есть могла
+  // уйти в бесконечный цикл под нагрузкой.
+  const { data, error } = await supabase.rpc('stock_take', { tool: toolId });
+  if (error) { console.error('takeStock', error.message); return false; }
+  return data === true;
+}
+
+/** Занять ячейку. Возвращает false, если её уже заняли.
+ *
+ *  ⚠️ Ячейка занималась безусловным UPDATE: два оплаченных заказа на один
+ *  инструмент оба её «занимали» и оба открывали замок — один инструмент
+ *  продавался дважды. Теперь занять может только тот, кто застал её свободной.
+ */
+async function claimCell(cellId) {
+  if (!cellId) return false;
+  const { data, error } = await supabase.rpc('cell_claim', { cell: cellId });
+  if (error) { console.error('claimCell', error.message); return false; }
+  return data === true;
 }
 async function returnStock(toolId) {
-  const { data: t } = await supabase.from('tools').select('sale_stock').eq('id', toolId).single();
-  await supabase.from('tools').update({ sale_stock: Number(t?.sale_stock || 0) + 1 }).eq('id', toolId);
+  const { error } = await supabase.rpc('stock_return', { tool: toolId });
+  if (error) console.error('returnStock', error.message);
 }
 
 // --- Подтверждение оплаты (Payme PerformTransaction / Click Complete) ---
@@ -297,7 +315,23 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
 
   // 2) Покупка (новая единица со склада): списываем остаток, ждём сборки/выдачи
   if (rental.kind === 'buy') {
+    // ⚠️ Нет остатка — заказ не принимаем. Раньше результат takeStock уходил
+    // лишь припиской в сообщение оператору: клиент оплачивал товар, которого
+    // на складе нет, и узнавал об этом в лучшем случае от менеджера.
     const ok = await takeStock(rental.tool_id);
+    if (!ok) {
+      await supabase.from('rentals').update({
+        status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending',
+      }).eq('id', rentalId);
+      await returnBonusById(rentalId);
+      await notifyUser(rental.user_id, rentalId, 'info', 'Товара не осталось',
+        `${paidText} К сожалению, ${name} закончился на складе. Деньги вернём в течение 1–3 рабочих дней.`,
+        paidKey('user'));
+      await notifyAdmin(
+        html`🚨 <b>Оплачен товар без остатка</b> №${rental.order_number} — ${name}, ${fmt(rental.total_price)} сум к возврату`,
+        { event: 'order.no_stock', dedupeKey: `order.no_stock:${rentalId}` });
+      return await loadRental(rentalId);
+    }
     await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
     if (rental.fulfillment === 'delivery') {
       await notifyUser(rental.user_id, rentalId, 'payment', 'Покупка оплачена',
@@ -319,8 +353,25 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
 
   // 3) Аренда с доставкой: ждём курьера, ячейку резервируем (экземпляр поедет клиенту)
   if (rental.fulfillment === 'delivery') {
+    // Тот же захват, что и для самовывоза: экземпляр поедет клиенту, и второй
+    // оплаченный заказ не должен получить тот же инструмент.
+    if (rental.tools?.cell_id) {
+      const got = await claimCell(rental.tools.cell_id);
+      if (!got) {
+        await supabase.from('rentals').update({
+          status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending',
+        }).eq('id', rentalId);
+        await returnBonusById(rentalId);
+        await notifyUser(rental.user_id, rentalId, 'info', 'Инструмент уже занят',
+          `${paidText} К сожалению, ${name} забрали раньше. Деньги вернём в течение 1–3 рабочих дней.`,
+          paidKey('user'));
+        await notifyAdmin(
+          html`🚨 <b>Оплачен занятый инструмент</b> №${rental.order_number} — ${name}, деньги к возврату`,
+          { event: 'order.cell_taken', dedupeKey: `order.cell_taken:${rentalId}` });
+        return await loadRental(rentalId);
+      }
+    }
     await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
-    if (rental.tools?.cell_id) await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
     await notifyUser(rental.user_id, rentalId, 'payment', 'Заказ оплачен',
       `${paidText} Курьер привезёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`, paidKey('user'));
     await notifyAdmin(
@@ -330,13 +381,37 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
     return rental;
   }
 
-  // 4) Аренда из бокса — активируем и открываем замок
+  // 4) Аренда из бокса — активируем и открываем замок.
+  // ⚠️ Сначала ПЫТАЕМСЯ занять ячейку, и только если она была свободна,
+  // активируем аренду. Экземпляр не резервируется до оплаты (так задумано),
+  // поэтому два оплаченных заказа могли достаться одной ячейке: оба получали
+  // активную аренду и открытый замок, а инструмент там один.
+  if (rental.tools?.cell_id) {
+    const got = await claimCell(rental.tools.cell_id);
+    if (!got) {
+      // Деньги уже приняты. Инструмента нет — заказ отменяем с пометкой на
+      // возврат и зовём оператора: это не та ситуация, которую можно замять.
+      await supabase.from('rentals').update({
+        status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending',
+      }).eq('id', rentalId);
+      await returnBonusById(rentalId);
+      await notifyUser(rental.user_id, rentalId, 'info', 'Инструмент уже занят',
+        `${paidText} К сожалению, ${name} забрали раньше. Деньги вернём в течение 1–3 рабочих дней.`,
+        paidKey('user'));
+      await notifyAdmin(
+        html`🚨 <b>Оплачен занятый инструмент</b> №${rental.order_number} — ${name}
+` +
+        html`${fmt(rental.total_price)} сум к возврату, ячейку занял другой заказ`,
+        { event: 'order.cell_taken', dedupeKey: `order.cell_taken:${rentalId}` });
+      return await loadRental(rentalId);
+    }
+  }
+
   const expectedEnd = new Date(now);
   expectedEnd.setDate(expectedEnd.getDate() + (rental.days || 1));
   await supabase.from('rentals').update({
     status: 'active', paid_at: nowIso, started_at: nowIso, expected_end: expectedEnd.toISOString(),
   }).eq('id', rentalId);
-  if (rental.tools?.cell_id) await supabase.from('cells').update({ status: 'occupied' }).eq('id', rental.tools.cell_id);
   let lockOpened = true;
   try {
     await openCellFor(rental);
@@ -423,8 +498,20 @@ async function cancelOrder(rental, by = 'user') {
 
   if (rental.status === 'pending_payment') {
     if (rental.kind === 'penalty' && by === 'user') return { error: 'Штраф отменить нельзя. По вопросам — в поддержку.' };
+    // ⚠️ Отмена пишется ТОЛЬКО если заказ всё ещё в том состоянии, которое мы
+    // проверяли. Раньше запись шла по id: пока шла проверка, оплата успевала
+    // активировать аренду и открыть замок — а отмена всё равно проходила.
+    const { data: done, error: cancelErr } = await supabase
+      .from('rentals')
+      .update({ status: 'cancelled', cancelled_at: nowIso })
+      .eq('id', rental.id)
+      .eq('status', 'pending_payment')
+      .select('id');
+    if (cancelErr) return { error: 'Не удалось отменить заказ' };
+    if (!done || !done.length) {
+      return { error: 'Заказ изменился — обновите список и попробуйте снова' };
+    }
     await returnBonus(rental);
-    await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: nowIso }).eq('id', rental.id);
     if (rental.kind === 'penalty') {
       await notifyUser(rental.user_id, rental.id, 'info', 'Штраф списан', `Счёт №${rental.order_number} аннулирован администратором.`);
     }
@@ -438,13 +525,25 @@ async function cancelOrder(rental, by = 'user') {
     return { error: 'Покупка уже лежит в ячейке — для отмены свяжитесь с поддержкой' };
   }
 
-  await returnBonus(rental);
-
   // Инструмент физически вне полки/ячейки? — ждём, пока сотрудник вернёт его
   const outOfPlace = rental.delivery_status === 'packed' || rental.delivery_status === 'ready';
-  await supabase.from('rentals').update({
-    status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending', restock_pending: outOfPlace,
-  }).eq('id', rental.id);
+
+  // Та же защита: отменяем только то, что ещё в ожидании доставки. Пока шла
+  // проверка, сотрудник мог отправить курьера — тогда отменять уже нельзя.
+  const { data: done2, error: cancelErr2 } = await supabase
+    .from('rentals')
+    .update({
+      status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending', restock_pending: outOfPlace,
+    })
+    .eq('id', rental.id)
+    .eq('status', 'pending_delivery')
+    .eq('delivery_status', rental.delivery_status)
+    .select('id');
+  if (cancelErr2) return { error: 'Не удалось отменить заказ' };
+  if (!done2 || !done2.length) {
+    return { error: 'Заказ уже изменился — обновите список и попробуйте снова' };
+  }
+  await returnBonus(rental);
 
   if (rental.kind === 'buy') {
     if (!outOfPlace) await returnStock(rental.tool_id); // единица не тронута — сразу на склад

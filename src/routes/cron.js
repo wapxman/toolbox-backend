@@ -115,11 +115,27 @@ router.get('/overdue', async (req, res) => {
 // Ячейки, которые должны быть заняты, по живым заказам; всё остальное освобождаем,
 // а занятые по факту, но помеченные free — занимаем. Возвращает список исправлений.
 async function reconcileCells() {
-  const { data: cells } = await supabase.from('cells').select('id, cell_number, status, tools(id)');
-  const { data: live } = await supabase
+  const { data: cells, error: cellsErr } = await supabase
+    .from('cells').select('id, cell_number, status, tools(id)');
+  const { data: live, error: liveErr } = await supabase
     .from('rentals')
     .select('kind, status, delivery_status, restock_pending, tool_id, pickup_cell_id, tools(cell_id)')
     .or('status.in.(active,overdue,pending_delivery),restock_pending.eq.true');
+
+  // ⚠️ НЕ ТРОГАЕМ ЯЧЕЙКИ, ЕСЛИ НЕ СМОГЛИ ПРОЧИТАТЬ ЗАКАЗЫ. Ошибка чтения
+  // давала пустой список живых заказов — и сверка «освобождала» все занятые
+  // ячейки разом, открывая чужие инструменты для оформления другими людьми.
+  // Молчаливое «ничего не нашлось» и «нечего занимать» — разные вещи.
+  if (cellsErr || liveErr) {
+    console.error('[CRON] сверка ячеек пропущена: не прочитались данные',
+      cellsErr?.message || '', liveErr?.message || '');
+    return [];
+  }
+  if (!Array.isArray(live) || !Array.isArray(cells)) {
+    console.error('[CRON] сверка ячеек пропущена: неожиданный ответ базы');
+    return [];
+  }
+
   const mustBeOccupied = new Set();
   for (const r of live || []) {
     if (r.restock_pending) {
@@ -132,7 +148,9 @@ async function reconcileCells() {
   }
   const fixed = [];
   for (const c of cells || []) {
-    if (c.status === 'maintenance') continue;
+    // maintenance — ручное состояние; pending_check — ячейка ждёт приёмки
+    // сотрудником после возврата. Ни то, ни другое сверка трогать не должна.
+    if (c.status === 'maintenance' || c.status === 'pending_check') continue;
     const want = mustBeOccupied.has(c.id) ? 'occupied' : 'free';
     if (c.status !== want) {
       const { error } = await supabase.from('cells').update({ status: want }).eq('id', c.id).eq('status', c.status);
