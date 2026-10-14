@@ -137,7 +137,7 @@ router.get('/overdue', async (req, res) => {
 // а занятые по факту, но помеченные free — занимаем. Возвращает список исправлений.
 async function reconcileCells() {
   const { data: cells, error: cellsErr } = await supabase
-    .from('cells').select('id, cell_number, status, tools(id)');
+    .from('cells').select('id, cell_number, status, updated_at, tools(id)');
   const { data: live, error: liveErr } = await supabase
     .from('rentals')
     .select('kind, status, delivery_status, restock_pending, tool_id, pickup_cell_id, tools(cell_id)')
@@ -168,16 +168,29 @@ async function reconcileCells() {
     if (r.kind === 'buy' && r.delivery_status === 'ready' && r.pickup_cell_id) mustBeOccupied.add(r.pickup_cell_id);
   }
   const fixed = [];
+  const stale = [];
   for (const c of cells || []) {
     // maintenance — ручное состояние; pending_check — ячейка ждёт приёмки
     // сотрудником после возврата. Ни то, ни другое сверка трогать не должна.
     if (c.status === 'maintenance' || c.status === 'pending_check') continue;
     const want = mustBeOccupied.has(c.id) ? 'occupied' : 'free';
     if (c.status !== want) {
-      const { error } = await supabase.from('cells').update({ status: want }).eq('id', c.id).eq('status', c.status);
-      if (!error) fixed.push({ cell: c.cell_number, from: c.status, to: want });
+      // ⚠️ ПИШЕМ ТОЛЬКО В НЕТРОНУТУЮ ЯЧЕЙКУ. Проверки по статусу не хватало:
+      // «занята» до сверки и «занята только что оплаченным заказом» — одно и то
+      // же значение, и условие `status = 'occupied'` совпадало с чужим свежим
+      // захватом. Сверка освобождала ячейку под оплаченным заказом, и клиент
+      // приходил к пустой. Метка времени делает эти два случая различимыми:
+      // любой захват её меняет, и наше условие перестаёт совпадать.
+      const { data: done, error } = await supabase
+        .from('cells').update({ status: want })
+        .eq('id', c.id).eq('status', c.status).eq('updated_at', c.updated_at)
+        .select('id');
+      if (error) continue;
+      if (done && done.length) fixed.push({ cell: c.cell_number, from: c.status, to: want });
+      else stale.push(c.cell_number); // ячейку изменили прямо сейчас — не наше дело
     }
   }
+  if (stale.length) console.log('[CRON] сверка: ячейки изменились во время сверки, пропущены:', stale.join(', '));
   return fixed;
 }
 

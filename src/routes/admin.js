@@ -78,10 +78,21 @@ router.patch('/orders/:id', async (req, res) => {
           return res.status(400).json({ error: 'Только для покупки с самовывозом' });
         }
         if (!cell_id) return res.status(400).json({ error: 'Укажите ячейку, куда положили инструмент' });
+        // Повторное нажатие не должно занимать вторую ячейку: первая осталась бы
+        // занятой навсегда, а в заказе хранится только последняя.
+        if (rental.delivery_status === 'ready') {
+          return res.status(400).json({ error: 'Заказ уже готов к выдаче' });
+        }
         const { data: cell } = await supabase.from('cells').select('id, cell_number, status, boxes(name)').eq('id', cell_id).single();
         if (!cell) return res.status(400).json({ error: 'Ячейка не найдена' });
         if (cell.status !== 'free') return res.status(400).json({ error: `Ячейка ${cell.cell_number} занята` });
-        await supabase.from('cells').update({ status: 'occupied' }).eq('id', cell.id);
+        // ⚠️ Занимаем ячейку тем же атомарным захватом, что и оплата. Проверка
+        // статуса выше — не блокировка: два оператора, раскладывающие два заказа
+        // одновременно, оба читали «свободна» и оба её занимали. Один и тот же
+        // инструмент обещали двум клиентам, и второй приходил к пустой ячейке.
+        if (!(await orders.claimCell(cell.id))) {
+          return res.status(409).json({ error: `Ячейку ${cell.cell_number} только что занял другой заказ — выберите другую` });
+        }
         await upd({ delivery_status: 'ready', pickup_cell_id: cell.id, packed_at: now });
         await orders.notifyUser(rental.user_id, rental.id, 'info', 'Покупка готова к выдаче',
           `${name} лежит в боксе «${cell.boxes?.name || ''}», ячейка ${cell.cell_number}. Откройте заказ в приложении и нажмите «Открыть ячейку», когда будете у бокса.`,
@@ -139,6 +150,8 @@ router.patch('/orders/:id', async (req, res) => {
             status: 'completed', actual_end: now, overdue_fee: overdueFee, return_method: 'courier', restock_pending: true,
           }).eq('id', parent.id);
           if (overdueFee > 0) await orders.createPenalty(parent, overdueFee);
+          // Инструмент уехал с курьером — продлевать уже нечего.
+          await orders.cancelExtensionBills(parent.id);
         }
         await orders.notifyUser(rental.user_id, rental.parent_rental_id || rental.id, 'info',
           overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
@@ -151,13 +164,24 @@ router.patch('/orders/:id', async (req, res) => {
       // или убрал новую единицу из ячейки обратно на склад (отмена покупки после «готов к выдаче»)
       case 'restocked': {
         if (!rental.restock_pending) return res.status(400).json({ error: 'Возврат в бокс не требуется' });
+        // ⚠️ ОТМЕТКУ СНИМАЕМ ПЕРВОЙ И АТОМАРНО. Раньше она снималась последней:
+        // два нажатия подряд (кнопка не блокируется, оператор щёлкает дважды)
+        // оба проходили проверку по уже прочитанному заказу и оба освобождали
+        // ячейку с возвратом единицы на склад. Кто снял отметку — тот и
+        // выполняет возврат; второй уходит ни с чем.
+        const { data: mine } = await supabase
+          .from('rentals')
+          .update({ restock_pending: false })
+          .eq('id', rental.id)
+          .eq('restock_pending', true)
+          .select('id');
+        if (!mine || !mine.length) return res.status(400).json({ error: 'Возврат в бокс уже отмечен' });
         if (rental.kind === 'buy') {
           if (rental.pickup_cell_id) await supabase.from('cells').update({ status: 'free' }).eq('id', rental.pickup_cell_id);
           await orders.returnStockOnce(rental);
         } else if (rental.tools?.cell_id) {
           await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
         }
-        await upd({ restock_pending: false });
         return res.json({ ok: true });
       }
 
@@ -168,11 +192,24 @@ router.patch('/orders/:id', async (req, res) => {
         const cellId = rental.kind === 'buy' ? rental.pickup_cell_id : rental.tools?.cell_id;
         if (!cellId) return res.status(400).json({ error: 'У заказа нет ячейки' });
         const { data: cell } = await supabase
-          .from('cells').select('id, status').eq('id', cellId).single();
+          .from('cells').select('id, status, pending_rental_id').eq('id', cellId).single();
         if (!cell || cell.status !== 'pending_check') {
           return res.status(400).json({ error: 'Эта ячейка не ждёт проверки' });
         }
-        await supabase.from('cells').update({ status: 'free' }).eq('id', cellId);
+        // ⚠️ ПРИЁМКУ ЗАКРЫВАЕТ ТОЛЬКО ТОТ ЗАКАЗ, КОТОРЫЙ ЕЁ ОТКРЫЛ. Ячейка
+        // определялась по инструменту, а заказов на один инструмент много:
+        // открыв в админке ЛЮБУЮ старую аренду того же инструмента, можно было
+        // подтвердить приёмку свежего возврата, не подходя к боксу. Ячейка
+        // становилась свободной, и следующий клиент оплачивал пустую.
+        if (cell.pending_rental_id !== rental.id) {
+          return res.status(409).json({
+            error: 'Ячейка ждёт приёмки по другому заказу — откройте его и подтвердите там',
+          });
+        }
+        await supabase.from('cells')
+          .update({ status: 'free', pending_rental_id: null })
+          .eq('id', cellId)
+          .eq('pending_rental_id', rental.id);
         return res.json({ ok: true });
       }
 
@@ -181,7 +218,14 @@ router.patch('/orders/:id', async (req, res) => {
       case 'return_missing': {
         const cellId = rental.kind === 'buy' ? rental.pickup_cell_id : rental.tools?.cell_id;
         if (!cellId) return res.status(400).json({ error: 'У заказа нет ячейки' });
-        await supabase.from('cells').update({ status: 'maintenance' }).eq('id', cellId);
+        // Та же защита, что и у приёмки: вывести ячейку из оборота может только
+        // заказ, по которому её на приёмку поставили.
+        const { data: mcell } = await supabase
+          .from('cells').select('status, pending_rental_id').eq('id', cellId).single();
+        if (mcell && mcell.status === 'pending_check' && mcell.pending_rental_id !== rental.id) {
+          return res.status(409).json({ error: 'Ячейка ждёт приёмки по другому заказу' });
+        }
+        await supabase.from('cells').update({ status: 'maintenance', pending_rental_id: null }).eq('id', cellId);
         await supabase.from('tools').update({ status: 'maintenance' }).eq('id', rental.tool_id);
         await orders.notifyAdmin(
           `🚨 Инструмент не найден в ячейке по заказу №${rental.order_number} — ячейка и инструмент выведены из оборота`,

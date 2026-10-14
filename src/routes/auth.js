@@ -87,13 +87,18 @@ router.post('/verify', async (req, res) => {
       return res.status(400).json({ error: 'Укажите номер и код' });
     }
 
-    // DEV-вход: пока SMS в режиме console (реальные SMS не подключены),
-    // принимаем мастер-код для тестирования без получения СМС.
-    // Как только SMS_PROVIDER станет реальным (eskiz/playmobile) — мастер-код
-    // автоматически перестанет работать.
-    const smsProvider = process.env.SMS_PROVIDER || 'console';
+    // DEV-вход мастер-кодом — только по явному разрешению.
+    //
+    // ⚠️ РАНЬШЕ УСЛОВИЕМ БЫЛО `SMS_PROVIDER || 'console'`. Вся защита аккаунтов
+    // держалась на наличии переменной окружения: сотри её на проде или разверни
+    // новое окружение, забыв перенести, — и код «0000» пускает в ЛЮБОЙ аккаунт,
+    // достаточно знать номер телефона. Отсутствие настройки обязано означать
+    // «запрещено», а не «можно всё». Теперь разрешение только включённое
+    // руками и только вне прода.
     const isDevMaster =
-      smsProvider === 'console' && code === (process.env.DEV_LOGIN_CODE || '0000');
+      process.env.ALLOW_DEV_LOGIN === '1' &&
+      process.env.NODE_ENV !== 'production' &&
+      code === (process.env.DEV_LOGIN_CODE || '0000');
     const isReviewer = isReviewLogin(phone, code);
 
     if (!isDevMaster && !isReviewer) {

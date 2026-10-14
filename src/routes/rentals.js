@@ -589,7 +589,14 @@ router.post('/:id/return', async (req, res) => {
     // открылся, — положили ли инструмент, система не видит. Раньше ячейка
     // освобождалась сразу, и следующий клиент оплачивал аренду пустой ячейки.
     // Теперь она ждёт проверки сотрудником.
-    await supabase.from('cells').update({ status: 'pending_check' }).eq('id', rental.tools.cell_id);
+    // Ячейка помнит, по какому заказу её поставили на приёмку: подтвердить
+    // приёмку можно будет только этим заказом, а не любым старым на тот же
+    // инструмент.
+    await supabase.from('cells')
+      .update({ status: 'pending_check', pending_rental_id: rental.id })
+      .eq('id', rental.tools.cell_id);
+    // Инструмент сдан — неоплаченные счета на продление больше ни к чему.
+    await orders.cancelExtensionBills(rental.id);
     const penalty = overdueFee > 0 ? await orders.createPenalty({ ...rental, order_number: updated.order_number }, overdueFee) : null;
     await orders.notifyUser(req.userId, rental.id, 'info',
       overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',

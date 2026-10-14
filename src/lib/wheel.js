@@ -249,10 +249,9 @@ async function promoState(cfg) {
     return { open: false, reason: 'finished', winners: 0, winnersLimit, endsAt };
   }
 
-  // ⚠️ Проверка и запись прокрутки не атомарны: если тысячный приз разыграют
-  // несколько человек в одну секунду, победителей может оказаться на единицы
-  // больше. Для акции на тысячу это допустимый перелёт, а не дыра — блокировка
-  // всей таблицы на каждую прокрутку обошлась бы дороже.
+  // Здесь счёт победителей нужен только для экрана и для быстрого «акция
+  // закрыта». Настоящий, не обгоняемый предел держит wheel_spin_record: он
+  // пересчитывает победителей внутри той же транзакции, что и запись приза.
   const winners = winnersLimit > 0 ? await winnersCount() : 0;
   if (winnersLimit > 0 && winners >= winnersLimit) {
     return { open: false, reason: 'all_won', winners, winnersLimit, endsAt };
@@ -314,40 +313,33 @@ async function spin(owner) {
   const prize = drawPrize(cfg.prizes);
   if (!prize) { const e = new Error('Призы не настроены'); e.code = 'no_prizes'; throw e; }
 
-  let walletEntryId = null;
-  if (userId && prize.kind === 'bonus' && Number(prize.amount) > 0) {
-    const expires = new Date(Date.now() + Number(cfg.expires_days || 30) * 86400_000).toISOString();
-    const { data, error } = await supabase
-      .from('wallet_entries')
-      .insert({
-        user_id: userId,
-        amount: Number(prize.amount),
-        kind: 'wheel_win',
-        expires_at: expires,
-        note: `Колесо Фортуны: ${prize.label}`,
-      })
-      .select('id')
-      .single();
-    if (error) throw new Error('не удалось начислить бонус: ' + error.message);
-    walletEntryId = data.id;
-  }
-
-  const { error: spinErr } = await supabase.from('wheel_spins').insert({
-    user_id: userId,
-    device_id: deviceId,
-    prize_code: prize.code,
-    prize_label: prize.label,
-    amount: Number(prize.amount || 0),
-    kind: prize.kind,
-    wallet_entry_id: walletEntryId,
-    claimed_at: userId ? new Date().toISOString() : null,
+  // ⚠️ НАЧИСЛЕНИЕ И ЗАПИСЬ ПРОКРУТКИ — ОДНА ТРАНЗАКЦИЯ. Раньше вошедшему
+  // пользователю сперва вставлялось начисление, потом прокрутка, а лимит
+  // попыток проверялся третьим запросом выше. Два одновременных нажатия
+  // (двойной тап, повтор запроса) проходили проверку оба и давали два приза за
+  // одну попытку; откат «удалим начисление, если прокрутка не вставилась» от
+  // этого не спасал — вставлялись-то обе. Теперь лимит попыток и лимит
+  // победителей пересчитываются внутри той же транзакции, что и записи.
+  const { data: rec, error: recErr } = await supabase.rpc('wheel_spin_record', {
+    uids: userId ? await accountChain(userId) : [],
+    dev: deviceId,
+    max_spins: Number(cfg.spins_per_user || 1),
+    winners_limit: Number(cfg.winners_limit || 0),
+    p_code: prize.code,
+    p_label: prize.label,
+    p_amount: Number(prize.amount || 0),
+    p_kind: prize.kind,
+    days_valid: Number(cfg.expires_days || 30),
   });
-  // ⚠️ Если запись прокрутки не прошла, а бонус уже начислен — откатываем
-  // начисление. Иначе человек получит бесплатную попытку и деньги: прокруток
-  // по счёту ноль, а бонус на счету.
-  if (spinErr) {
-    if (walletEntryId) await supabase.from('wallet_entries').delete().eq('id', walletEntryId);
-    throw new Error('не удалось записать прокрутку: ' + spinErr.message);
+  if (recErr) throw new Error('не удалось записать прокрутку: ' + recErr.message);
+  const row = Array.isArray(rec) ? rec[0] : rec;
+  if (!row || !row.spin_id) {
+    // Гонку проиграли: пока крутилось колесо, попытка или призы кончились.
+    const e = new Error(row && row.reason === 'all_won'
+      ? 'Все призы акции уже разыграны'
+      : 'Вы уже использовали свою попытку');
+    e.code = row && row.reason === 'all_won' ? 'closed' : 'no_spins';
+    throw e;
   }
 
   return {

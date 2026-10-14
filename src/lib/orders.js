@@ -130,6 +130,40 @@ async function createPenalty(rental, fee, provider = 'payme') {
   return pen;
 }
 
+/** Снять неоплаченные счета на продление закрывшейся аренды.
+ *
+ *  ⚠️ Счёт на продление живёт отдельным заказом и ждёт оплаты. Клиент мог
+ *  выставить его, передумать и сдать инструмент — а счёт остался в «Заказах»
+ *  с живой кнопкой оплаты. Оплата по сданной аренде бессмысленна: продлевать
+ *  нечего, деньги пришлось бы возвращать вручную. Поэтому в момент возврата
+ *  счёт гасим сами и возвращаем бонус, если им частично платили.
+ */
+async function cancelExtensionBills(rentalId) {
+  if (!rentalId) return 0;
+  const { data: bills } = await supabase
+    .from('rentals')
+    .select('id, user_id, order_number, bonus_applied, kind, status')
+    .eq('parent_rental_id', rentalId)
+    .eq('kind', 'extension')
+    .eq('status', 'pending_payment');
+  let closed = 0;
+  for (const b of bills || []) {
+    const { data: done } = await supabase
+      .from('rentals')
+      .update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
+      .eq('id', b.id)
+      .eq('status', 'pending_payment')
+      .select('id');
+    if (!done || !done.length) continue; // счёт успели оплатить — трогать нельзя
+    await returnBonus(b);
+    closed++;
+    await notifyUser(b.user_id, b.id, 'info', 'Счёт на продление снят',
+      `Инструмент возвращён, продлевать нечего — счёт №${b.order_number} аннулирован.`,
+      { event: 'extension.cancelled', dedupeKey: `extension.cancelled:${b.id}` });
+  }
+  return closed;
+}
+
 // Неоплаченные штрафы пользователя (для блокировки новых аренд)
 async function unpaidPenalties(userId) {
   const { data } = await supabase.from('rentals')
@@ -304,28 +338,60 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
     const extraDays = Number(rental.days || 0);
     const { data: parent } = await supabase
       .from('rentals')
-      .select('id, days, expected_end, status, order_number, tools(name)')
+      .select('id, days, expected_end, status, items_price, total_price, order_number, tools(name)')
       .eq('id', rental.parent_rental_id)
       .single();
 
-    if (parent) {
-      // Отсчитываем от большей из двух дат: если срок уже вышел, продление
-      // должно давать дни от сегодня, а не задним числом закрывать просрочку.
-      const base = new Date(Math.max(new Date(parent.expected_end).getTime(), now.getTime()));
-      const newEnd = new Date(base.getTime() + extraDays * 86400_000);
-      await supabase.from('rentals').update({
-        days: Number(parent.days || 0) + extraDays,
-        expected_end: newEnd.toISOString(),
-        // Просрочка снимается только потому, что срок действительно оплачен.
-        status: parent.status === 'overdue' ? 'active' : parent.status,
-      }).eq('id', parent.id);
+    // ⚠️ ПРОДЛЕВАТЬ МОЖНО ТОЛЬКО ЖИВУЮ АРЕНДУ. Счёт на продление висит, пока
+    // его не оплатят, и клиент мог успеть сдать инструмент — а оплатив счёт
+    // после возврата, он «продлевал» завершённую аренду: срок уезжал в будущее
+    // по сданному инструменту, просрочка обнулялась, а уже выставленный штраф
+    // оставался без основания. Деньги у кассы, поэтому молча не глотаем:
+    // счёт помечаем к возврату и зовём оператора.
+    if (!parent || !['active', 'overdue'].includes(parent.status)) {
+      await supabase.from('rentals')
+        .update({ status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending' })
+        .eq('id', rentalId);
+      await notifyUser(rental.user_id, rentalId, 'payment', 'Продление не применено',
+        `${paidText} Аренда уже закрыта, продлевать нечего — деньги вернутся тем же способом оплаты в течение 1–3 рабочих дней.`,
+        paidKey('user'));
+      await notifyAdmin(
+        html`⚠️ <b>Оплата продления по закрытой аренде</b> №${rental.order_number} — ${fmt(amountSum)} сум к возврату в кассе ${rental.payment_provider}`,
+        paidKey('ops'));
+      return await loadRental(rentalId);
     }
+
+    // ⚠️ ОТСЧЁТ ВСЕГДА ОТ СТАРОГО СРОКА, НЕ ОТ «СЕГОДНЯ». Раньше базой была
+    // большая из дат, и просроченная аренда при продлении получала дни заново
+    // от текущего момента: дни, уже проведённые в просрочке, становились
+    // бесплатными, а статус с overdue переключался на active — штраф за них
+    // не начислялся вообще. Купленные дни покрывают именно те дни, которые
+    // инструмент пробыл у клиента; если их не хватило, аренда остаётся
+    // просроченной и штраф за остаток выставится при возврате.
+    const newEnd = new Date(new Date(parent.expected_end).getTime() + extraDays * 86400_000);
+
+    // ⚠️ ЦЕНУ ДОБАВЛЯЕМ ВМЕСТЕ С ДНЯМИ. Штраф считается как
+    // (items_price − discount) / days × дни просрочки × коэффициент: нарастить
+    // одни дни — значит разделить ту же сумму на большее число и вдвое
+    // удешевить каждый последующий день просрочки. Доплата за продление —
+    // такая же плата за дни той же аренды, её место в той же сумме.
+    await supabase.from('rentals').update({
+      days: Number(parent.days || 0) + extraDays,
+      expected_end: newEnd.toISOString(),
+      items_price: Number(parent.items_price || 0) + Number(rental.items_price || 0),
+      total_price: Number(parent.total_price || 0) + Number(rental.total_price || 0),
+      // Просрочка снимается только если оплаченных дней хватило её закрыть.
+      status: newEnd.getTime() >= now.getTime() ? 'active' : 'overdue',
+    }).eq('id', parent.id);
 
     await supabase.from('rentals')
       .update({ status: 'completed', paid_at: nowIso, actual_end: nowIso })
       .eq('id', rentalId);
+    const stillOverdue = newEnd.getTime() < now.getTime();
     await notifyUser(rental.user_id, rental.parent_rental_id || rentalId, 'payment', 'Аренда продлена',
-      `${paidText} Срок увеличен на ${extraDays} дн.`, paidKey('user'));
+      `${paidText} Срок увеличен на ${extraDays} дн. — до ${newEnd.toLocaleDateString('ru-RU')}.`
+      + (stillOverdue ? ' Срок всё равно уже прошёл: верните инструмент, иначе штраф продолжит расти.' : ''),
+      paidKey('user'));
     return await loadRental(rentalId);
   }
 
@@ -596,7 +662,7 @@ async function cancelOrder(rental, by = 'user') {
 
 module.exports = {
   getPricing, getDelivery, getSupport, getTerms, calculatePrice, overdueFeeFor, availableSlots, resolveSlot,
-  createPenalty, unpaidPenalties,
+  createPenalty, unpaidPenalties, cancelExtensionBills,
   RENTAL_FULL, loadRental, openLock, cellOf, openCellFor, notifyUser, notifyAdmin,
   takeStock, returnStock, returnStockOnce, claimCell, confirmPayment, pickupPurchase, cancelOrder, returnBonusById,
   describe, addressLine, fmt,
