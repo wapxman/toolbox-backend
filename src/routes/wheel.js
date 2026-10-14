@@ -101,6 +101,38 @@ router.post('/claim', auth, async (req, res) => {
   }
 });
 
+// GET /api/wheel/balance — только счёт и ближайшее сгорание.
+// Отдельно от /wallet: баланс показывается на главной, в магазине и в профиле,
+// и тащить ради строчки полсотни движений кошелька незачем.
+router.get('/balance', auth, async (req, res) => {
+  try {
+    const supabase = require('../lib/supabase');
+    const cfg = await wheel.getConfig();
+    const [balance, { data: rows }] = await Promise.all([
+      wheel.balanceOf(req.userId),
+      supabase
+        .from('wallet_entries')
+        .select('expires_at')
+        .eq('user_id', req.userId)
+        .gt('amount', 0)
+        .not('expires_at', 'is', null)
+        .gt('expires_at', new Date().toISOString())
+        .order('expires_at', { ascending: true })
+        .limit(1),
+    ]);
+    res.json({
+      balance,
+      max_pay_pct: Number(cfg.max_pay_pct || 50),
+      // Ближайшее сгорание — то, ради чего человек возвращается. Молчать о нём
+      // нечестно: бонус исчезнет, а он и не узнает.
+      expires_at: rows && rows.length ? rows[0].expires_at : null,
+    });
+  } catch (err) {
+    console.error('wallet balance error:', err);
+    res.status(500).json({ error: 'Не удалось загрузить бонусный счёт' });
+  }
+});
+
 // GET /api/wheel/wallet — баланс и история движений.
 router.get('/wallet', auth, async (req, res) => {
   try {
