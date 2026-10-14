@@ -233,6 +233,50 @@ router.patch('/orders/:id', async (req, res) => {
         return res.json({ ok: true });
       }
 
+      // Завершить аренду вручную: сотрудник принял инструмент на месте.
+      //
+      // ⚠️ Раньше админка делала это прямым PATCH в базу: ставила completed и
+      // освобождала ячейку. Мимо проходило всё — просрочка не считалась, счёт
+      // за неё не выставлялся, неоплаченный счёт на продление оставался живым,
+      // а ноль изменённых строк выглядел как успех. Деньги терялись тихо.
+      case 'close_rental': {
+        if (rental.kind !== 'rent') return res.status(400).json({ error: 'Это не аренда' });
+        if (!['active', 'overdue'].includes(rental.status)) {
+          return res.status(400).json({ error: 'Аренда не активна — завершать нечего' });
+        }
+        const overdueFee = await orders.overdueFeeFor(rental);
+        const { data: done } = await supabase
+          .from('rentals')
+          .update({
+            status: 'completed', actual_end: now, overdue_fee: overdueFee,
+            return_method: rental.return_method || 'manual',
+          })
+          .eq('id', rental.id)
+          .in('status', ['active', 'overdue'])
+          .select('id');
+        if (!done || !done.length) {
+          return res.status(409).json({ error: 'Аренда уже изменилась — обновите список' });
+        }
+        // Инструмент в руках у сотрудника: ячейка свободна, приёмка не нужна.
+        if (rental.tools?.cell_id) {
+          await supabase.from('cells')
+            .update({ status: 'free', pending_rental_id: null })
+            .eq('id', rental.tools.cell_id);
+        }
+        await orders.cancelExtensionBills(rental.id);
+        const penalty = overdueFee > 0 ? await orders.createPenalty(rental, overdueFee) : null;
+        await orders.notifyUser(rental.user_id, rental.id, 'info',
+          overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент принят',
+          overdueFee > 0
+            ? `${name} принят сотрудником. Штраф за просрочку ${orders.fmt(overdueFee)} сум — счёт выставлен.`
+            : `${name} принят сотрудником. Спасибо за использование Taketool!`,
+          once('rental.closed'));
+        return res.json({
+          ok: true, overdue_fee: overdueFee,
+          penalty_order_number: penalty?.order_number || null,
+        });
+      }
+
       case 'refunded': {
         if (rental.refund_status !== 'pending') return res.status(400).json({ error: 'Возврат денег не ожидается' });
         await upd({ refund_status: 'done' });
