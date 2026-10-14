@@ -255,16 +255,25 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
   // кто первым проставил paid_at — тот и обрабатывает, второй уходит ни с чем.
   const { data: claimed, error: claimErr } = await supabase
     .from('rentals')
-    .update({ paid_at: nowIso })
+    .update({ status: 'processing_payment', paid_at: nowIso })
     .eq('id', rentalId)
     .eq('status', 'pending_payment')
     .is('paid_at', null)
     .select('id');
   if (claimErr) throw new Error('не удалось зафиксировать оплату: ' + claimErr.message);
   if (!claimed || !claimed.length) {
-    // Гонку проиграли — заказ уже обрабатывает кто-то другой. Платёж при этом
-    // не теряем: он записан в transactions ниже по общему пути повторного
-    // вызова, а состояние заказа менять второй раз нельзя.
+    // Гонку проиграли — заказ уже обрабатывает кто-то другой.
+    // ⚠️ Платёж всё равно фиксируем в журнале: иначе второй самостоятельный
+    // платёж (клиент открыл и Payme, и Click) исчезает из учёта, и вернуть
+    // его будет не на основании чего.
+    await supabase.from('transactions').insert({
+      rental_id: rentalId, user_id: rental.user_id,
+      amount: Math.round(Number(amountSum)), type: 'payment',
+      payment_method: method, payment_id: String(paymentId), status: 'duplicate',
+    });
+    await notifyAdmin(
+      html`⚠️ <b>Повторный платёж</b> по заказу №${rental.order_number} — ${fmt(amountSum)} сум (${method}). Проверьте необходимость возврата.`,
+      { event: 'payment.duplicate', dedupeKey: `payment.duplicate:${rentalId}:${paymentId}` });
     return await loadRental(rentalId);
   }
 

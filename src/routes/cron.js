@@ -73,6 +73,27 @@ router.get('/overdue', async (req, res) => {
     // по вине человека, и выигрыш сгорать за это не должен.
     for (const r of stale || []) await orders.returnBonusById(r.id);
 
+    // 3.5) Заказы, застрявшие в обработке оплаты. Деньги приняты, а обработка
+    // оборвалась посередине — такой заказ нельзя ни отменить, ни активировать
+    // автоматически: решение за человеком. Зовём оператора, статус не трогаем.
+    let stuckPayments = 0;
+    try {
+      const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+      const { data: stuck } = await supabase
+        .from('rentals')
+        .select('id, order_number, total_price, payment_provider')
+        .eq('status', 'processing_payment')
+        .lt('paid_at', tenMinAgo);
+      for (const r of stuck || []) {
+        await notify.notifyAdmin(
+          `🚨 Заказ №${r.order_number} завис в обработке оплаты (${r.total_price} сум, ${r.payment_provider}). Деньги приняты, обработка не завершена — разберитесь вручную.`,
+          { event: 'order.stuck', dedupeKey: `order.stuck:${r.id}` });
+        stuckPayments++;
+      }
+    } catch (e) {
+      console.error('[CRON] проверка зависших оплат не прошла:', e.message);
+    }
+
     // 4) Бонус скоро сгорит — напоминаем. Срок виден на экранах, но человек
     //    в приложение не заходит, и выигрыш сгорает молча: мы подарили, он не
     //    узнал. Ключ дедупликации с датой сгорания — напомним один раз на
@@ -104,7 +125,7 @@ router.get('/overdue', async (req, res) => {
       console.error('sms status refresh failed:', e.message);
     }
 
-    console.log(`[CRON overdue] бонусных напоминаний: ${bonusWarned}, помечено: ${marked}, брошенных отменено: ${(stale || []).length}, ячеек исправлено: ${fixedCells.length}, статусов SMS обновлено: ${sms.updated}`);
+    console.log(`[CRON overdue] зависших оплат: ${stuckPayments}, бонусных напоминаний: ${bonusWarned}, помечено: ${marked}, брошенных отменено: ${(stale || []).length}, ячеек исправлено: ${fixedCells.length}, статусов SMS обновлено: ${sms.updated}`);
     res.json({ ok: true, marked, bonus_warned: bonusWarned, stale_cancelled: (stale || []).length, cells_fixed: fixedCells, sms_statuses_updated: sms.updated });
   } catch (err) {
     console.error('cron overdue error:', err);

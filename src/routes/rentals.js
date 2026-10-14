@@ -300,7 +300,12 @@ router.get('/active', async (req, res) => {
       .from('rentals')
       .select(RENTAL_SELECT)
       .eq('user_id', req.userId)
-      .or(`status.in.(${ACTIVE_STATUSES.join(',')}),and(kind.eq.penalty,status.eq.pending_payment)`)
+      // ⚠️ Неоплаченные счета тоже показываем: штраф И продление. Иначе человек
+      // уходит с экрана оплаты продления — и счёт пропадает из «Заказов»,
+      // оплатить его больше неоткуда, а повторное продление запрещено.
+      .or(`status.in.(${ACTIVE_STATUSES.join(',')}),`
+        + `and(kind.eq.penalty,status.eq.pending_payment),`
+        + `and(kind.eq.extension,status.eq.pending_payment)`)
       .neq('kind', 'courier_return')
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -341,15 +346,33 @@ router.get('/:id', async (req, res) => {
       .single();
     if (error || !data) return res.status(404).json({ error: 'Заказ не найден' });
 
+    // ⚠️ Дочерние заказы бывают разных видов: вызов курьера, штраф, счёт на
+    // продление. Без фильтра по kind неоплаченный счёт продления приезжал в
+    // поле courier_return — приложение показывало «вызов курьера не оплачен»
+    // и прятало кнопку «Вернуть инструмент».
     const { data: ret } = await supabase
       .from('rentals')
       .select('id, status, delivery_status, delivery_slot_label, courier_name, courier_phone, total_price')
       .eq('parent_rental_id', data.id)
+      .eq('kind', 'courier_return')
       .in('status', ['pending_payment', 'pending_delivery'])
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    res.json({ ...data, courier_return: ret || null });
+
+    // Неоплаченный счёт на продление отдаём отдельным полем, чтобы приложение
+    // могло довести человека до оплаты, а не терять счёт после ухода с экрана.
+    const { data: ext } = await supabase
+      .from('rentals')
+      .select('id, order_number, days, items_price, bonus_applied, total_price, payment_provider')
+      .eq('parent_rental_id', data.id)
+      .eq('kind', 'extension')
+      .eq('status', 'pending_payment')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    res.json({ ...data, courier_return: ret || null, extension_bill: ext || null });
   } catch (err) {
     console.error('rental detail error:', err);
     res.status(500).json({ error: 'Ошибка' });
@@ -602,8 +625,11 @@ router.post('/:id/return-courier', async (req, res) => {
     if (rental.kind !== 'rent' || !['active', 'overdue'].includes(rental.status)) {
       return res.status(400).json({ error: 'Курьера можно вызвать только по активной аренде' });
     }
+    // Только настоящий вызов курьера: счёт на продление или штраф не должны
+    // выдавать себя за оформленный вызов и запрещать его.
     const { data: existing } = await supabase
       .from('rentals').select('id').eq('parent_rental_id', rental.id)
+      .eq('kind', 'courier_return')
       .in('status', ['pending_payment', 'pending_delivery']).limit(1);
     if (existing && existing.length) {
       return res.status(400).json({ error: 'Вызов курьера уже оформлен' });
