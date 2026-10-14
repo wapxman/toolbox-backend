@@ -22,6 +22,7 @@ const kerong = require('./kerong');
 // Уведомления идут через outbox (lib/notify): сперва строка в базе, потом доставка
 // с повторами. html`…` экранирует подставленное — в сообщения попадает ввод клиента.
 const { notifyUser, notifyAdmin, html } = require('./notify');
+const wheel = require('./wheel');
 
 const TZ_OFFSET = '+05:00'; // Ташкент
 
@@ -321,6 +322,25 @@ async function pickupPurchase(rental) {
   return { ok: true, cell_number: rental.pickup_cell?.cell_number };
 }
 
+/** Вернуть на счёт бонус, ушедший в этот заказ.
+ *
+ *  Живёт рядом с отменой и зовётся из единственного места — самой отмены:
+ *  разложи возврат по роутам, и какой-нибудь путь рано или поздно забудут,
+ *  а бонус сгорит ни за что.
+ *
+ *  Сбой возврата не рушит отмену: заказ отменить важнее. Ошибка уходит в лог,
+ *  бонус можно вернуть руками — обратное (отменить нельзя, потому что не
+ *  вернулся бонус) было бы хуже для человека.
+ */
+async function returnBonus(rental) {
+  if (!rental || !(rental.bonus_applied > 0)) return;
+  try {
+    await wheel.refund(rental.user_id, rental.id);
+  } catch (e) {
+    console.error('bonus refund error:', rental.id, e);
+  }
+}
+
 // Отмена заказа. Возвращает {ok, refund_required} или {error}.
 async function cancelOrder(rental, by = 'user') {
   if (!rental) return { error: 'Заказ не найден' };
@@ -329,6 +349,7 @@ async function cancelOrder(rental, by = 'user') {
 
   if (rental.status === 'pending_payment') {
     if (rental.kind === 'penalty' && by === 'user') return { error: 'Штраф отменить нельзя. По вопросам — в поддержку.' };
+    await returnBonus(rental);
     await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: nowIso }).eq('id', rental.id);
     if (rental.kind === 'penalty') {
       await notifyUser(rental.user_id, rental.id, 'info', 'Штраф списан', `Счёт №${rental.order_number} аннулирован администратором.`);
@@ -342,6 +363,8 @@ async function cancelOrder(rental, by = 'user') {
   if (by === 'user' && rental.delivery_status === 'ready') {
     return { error: 'Покупка уже лежит в ячейке — для отмены свяжитесь с поддержкой' };
   }
+
+  await returnBonus(rental);
 
   // Инструмент физически вне полки/ячейки? — ждём, пока сотрудник вернёт его
   const outOfPlace = rental.delivery_status === 'packed' || rental.delivery_status === 'ready';

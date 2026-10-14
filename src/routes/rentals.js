@@ -3,6 +3,7 @@ const supabase = require('../lib/supabase');
 const kerong = require('../lib/kerong');
 const clickMapi = require('../lib/click_mapi');
 const orders = require('../lib/orders');
+const wheel = require('../lib/wheel');
 const auth = require('../middleware/auth');
 
 const router = express.Router();
@@ -152,7 +153,19 @@ router.post('/', async (req, res) => {
       deliveryFields = parsed.fields;
       deliveryFee = (await orders.getDelivery()).fee || 0;
     }
-    const totalPrice = itemsPrice - discount + deliveryFee;
+    // Бонус с Колеса Фортуны. Потолок считается от стоимости товаров ПОСЛЕ
+    // скидки за срок и БЕЗ доставки: доставка — наш прямой расход курьеру,
+    // закрывать её бонусом нельзя.
+    //
+    // ⚠️ Списываем в момент создания заказа, а не оплаты. Иначе одним и тем же
+    // бонусом можно оформить десять заказов: в каждом сумма к оплате уже
+    // уменьшена, а списание произошло бы только один раз.
+    const wheelCfg = await wheel.getConfig();
+    const bonusBalance = await wheel.balanceOf(req.userId);
+    const bonusWanted = wheel.applicable(
+      bonusBalance, itemsPrice - discount, Number(wheelCfg.max_pay_pct || 50),
+    );
+    const totalPrice = itemsPrice - discount + deliveryFee - bonusWanted;
 
     // started_at/expected_end предварительные: для доставки пересчитаются при передаче
     const startedAt = new Date();
@@ -173,6 +186,7 @@ router.post('/', async (req, res) => {
         items_price: itemsPrice,
         discount,
         delivery_fee: deliveryFee,
+        bonus_applied: bonusWanted,
         total_price: totalPrice,
         payment_provider: provider,
         terms_version: String(terms.version),
@@ -181,6 +195,28 @@ router.post('/', async (req, res) => {
       .select()
       .single();
     if (rentalErr) throw rentalErr;
+
+    // Теперь действительно списываем бонус и сверяем с тем, что ушло: баланс
+    // мог измениться между расчётом и записью (например, параллельный заказ),
+    // а счёт обязан сходиться с фактом, а не с намерением. Списали меньше —
+    // поправляем сумму к оплате, пока человек её ещё не увидел.
+    if (bonusWanted > 0) {
+      let spent = 0;
+      try {
+        spent = await wheel.spend(req.userId, rental.id, bonusWanted);
+      } catch (e) {
+        // Заказ не рушим: без бонуса он просто дороже, и это лучше, чем отказ.
+        console.error('bonus spend error:', e);
+      }
+      if (spent !== bonusWanted) {
+        const fixedTotal = itemsPrice - discount + deliveryFee - spent;
+        await supabase.from('rentals')
+          .update({ bonus_applied: spent, total_price: fixedTotal })
+          .eq('id', rental.id);
+        rental.bonus_applied = spent;
+        rental.total_price = fixedTotal;
+      }
+    }
 
     // Журнал согласий: кто, когда, какая редакция, по какому заказу
     await supabase.from('consents').insert({
