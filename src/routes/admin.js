@@ -153,7 +153,7 @@ router.patch('/orders/:id', async (req, res) => {
         if (!rental.restock_pending) return res.status(400).json({ error: 'Возврат в бокс не требуется' });
         if (rental.kind === 'buy') {
           if (rental.pickup_cell_id) await supabase.from('cells').update({ status: 'free' }).eq('id', rental.pickup_cell_id);
-          await orders.returnStock(rental.tool_id);
+          await orders.returnStockOnce(rental);
         } else if (rental.tools?.cell_id) {
           await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
         }

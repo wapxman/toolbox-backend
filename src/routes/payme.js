@@ -236,7 +236,7 @@ async function cancelTransaction(params) {
       return { result: { transaction: tx.id, cancel_time: cancelTime, state: newState } };
     }
     await orders.returnBonusById(tx.rental_id); // отмена транзакции — возвращаем и бонус
-    if (afterPay && rental.kind === 'buy') await orders.returnStock(rental.tool_id);
+    if (afterPay) await orders.returnStockOnce(rental);
     // Ячейку освобождаем только по самому заказу; вызов курьера (courier_return) ячейкой не владеет
     if (rental?.tools?.cells && rental.kind === 'rent') {
       await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);

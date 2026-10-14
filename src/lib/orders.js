@@ -218,6 +218,27 @@ async function returnStock(toolId) {
   if (error) console.error('returnStock', error.message);
 }
 
+/** Вернуть складскую единицу по заказу — ровно один раз.
+ *
+ *  ⚠️ Возврат склада зовут три места: общая отмена, отмена со стороны кассы и
+ *  кнопка «вернул в бокс» в админке. По одному заказу они срабатывали дважды,
+ *  и остаток рос из воздуха. Отметка ставится атомарно: кто её поставил, тот и
+ *  возвращает единицу.
+ */
+async function returnStockOnce(rental) {
+  if (!rental || rental.kind !== 'buy' || !rental.tool_id) return false;
+  const { data, error } = await supabase
+    .from('rentals')
+    .update({ stock_returned: true })
+    .eq('id', rental.id)
+    .eq('stock_returned', false)
+    .select('id');
+  if (error) { console.error('returnStockOnce', error.message); return false; }
+  if (!data || !data.length) return false; // уже возвращали
+  await returnStock(rental.tool_id);
+  return true;
+}
+
 // --- Подтверждение оплаты (Payme PerformTransaction / Click Complete) ---
 async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
   const rental = await loadRental(rentalId);
@@ -546,7 +567,7 @@ async function cancelOrder(rental, by = 'user') {
   await returnBonus(rental);
 
   if (rental.kind === 'buy') {
-    if (!outOfPlace) await returnStock(rental.tool_id); // единица не тронута — сразу на склад
+    if (!outOfPlace) await returnStockOnce(rental); // единица не тронута — сразу на склад
     // ready: единица в ячейке, ячейка занята до «в боксе/на складе» (restocked)
   } else if (rental.kind === 'rent') {
     if (!outOfPlace && rental.tools?.cell_id) await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
@@ -568,6 +589,6 @@ module.exports = {
   getPricing, getDelivery, getSupport, getTerms, calculatePrice, overdueFeeFor, availableSlots, resolveSlot,
   createPenalty, unpaidPenalties,
   RENTAL_FULL, loadRental, openLock, cellOf, openCellFor, notifyUser, notifyAdmin,
-  takeStock, returnStock, confirmPayment, pickupPurchase, cancelOrder, returnBonusById,
+  takeStock, returnStock, returnStockOnce, claimCell, confirmPayment, pickupPurchase, cancelOrder, returnBonusById,
   describe, addressLine, fmt,
 };

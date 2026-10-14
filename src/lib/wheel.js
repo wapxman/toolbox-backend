@@ -425,11 +425,13 @@ async function claimFor(userId, deviceId) {
  *  Берём начисления, которые сгорают в ближайшие [days] суток и ещё не
  *  потрачены целиком. Возвращает [{ userId, amount, expiresAt }].
  */
-async function expiringSoon(days = 3) {
+async function expiringSoon(days = 3, onlyUserId = null) {
   const now = new Date();
   const until = new Date(now.getTime() + days * 86400_000);
 
-  const { data: credits, error } = await supabase
+  // Та же выборка служит двум задачам: рассылке напоминаний (по всем) и экрану
+  // баланса одного человека — ему нужен ближайший срок среди ЖИВЫХ остатков.
+  let q = supabase
     .from('wallet_entries')
     .select('id, user_id, amount, expires_at')
     .gt('amount', 0)
@@ -437,6 +439,9 @@ async function expiringSoon(days = 3) {
     .not('expires_at', 'is', null)
     .gt('expires_at', now.toISOString())
     .lte('expires_at', until.toISOString());
+  if (onlyUserId) q = q.eq('user_id', onlyUserId);
+
+  const { data: credits, error } = await q;
   if (error) throw new Error('не удалось найти сгорающие бонусы: ' + error.message);
   if (!credits || !credits.length) return [];
 
