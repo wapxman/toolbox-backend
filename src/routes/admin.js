@@ -151,7 +151,7 @@ router.patch('/orders/:id', async (req, res) => {
           }).eq('id', parent.id);
           if (overdueFee > 0) await orders.createPenalty(parent, overdueFee);
           // Инструмент уехал с курьером — продлевать уже нечего.
-          await orders.cancelExtensionBills(parent.id);
+          await orders.cancelChildBills(parent.id);
         }
         await orders.notifyUser(rental.user_id, rental.parent_rental_id || rental.id, 'info',
           overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
@@ -263,7 +263,7 @@ router.patch('/orders/:id', async (req, res) => {
             .update({ status: 'free', pending_rental_id: null })
             .eq('id', rental.tools.cell_id);
         }
-        await orders.cancelExtensionBills(rental.id);
+        await orders.cancelChildBills(rental.id);
         const penalty = overdueFee > 0 ? await orders.createPenalty(rental, overdueFee) : null;
         await orders.notifyUser(rental.user_id, rental.id, 'info',
           overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент принят',

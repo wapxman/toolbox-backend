@@ -130,21 +130,27 @@ async function createPenalty(rental, fee, provider = 'payme') {
   return pen;
 }
 
-/** Снять неоплаченные счета на продление закрывшейся аренды.
+/** Снять неоплаченные дочерние счета закрывшейся аренды.
  *
- *  ⚠️ Счёт на продление живёт отдельным заказом и ждёт оплаты. Клиент мог
- *  выставить его, передумать и сдать инструмент — а счёт остался в «Заказах»
- *  с живой кнопкой оплаты. Оплата по сданной аренде бессмысленна: продлевать
- *  нечего, деньги пришлось бы возвращать вручную. Поэтому в момент возврата
- *  счёт гасим сами и возвращаем бонус, если им частично платили.
+ *  ⚠️ Продление и вызов курьера живут отдельными заказами и ждут оплаты.
+ *  Клиент мог выставить такой счёт, передумать и сдать инструмент сам — а счёт
+ *  остался в «Заказах» с живой кнопкой оплаты. Оплатить его после возврата
+ *  бессмысленно: продлевать нечего, забирать нечего, деньги пришлось бы
+ *  возвращать вручную. Поэтому в момент возврата гасим их сами и возвращаем
+ *  бонус, если им частично платили.
  */
-async function cancelExtensionBills(rentalId) {
+const CHILD_BILL_TEXT = {
+  extension: ['Счёт на продление снят', 'Инструмент возвращён, продлевать нечего'],
+  courier_return: ['Вызов курьера отменён', 'Инструмент уже возвращён, забирать нечего'],
+};
+
+async function cancelChildBills(rentalId) {
   if (!rentalId) return 0;
   const { data: bills } = await supabase
     .from('rentals')
     .select('id, user_id, order_number, bonus_applied, kind, status')
     .eq('parent_rental_id', rentalId)
-    .eq('kind', 'extension')
+    .in('kind', ['extension', 'courier_return'])
     .eq('status', 'pending_payment');
   let closed = 0;
   for (const b of bills || []) {
@@ -157,9 +163,10 @@ async function cancelExtensionBills(rentalId) {
     if (!done || !done.length) continue; // счёт успели оплатить — трогать нельзя
     await returnBonus(b);
     closed++;
-    await notifyUser(b.user_id, b.id, 'info', 'Счёт на продление снят',
-      `Инструмент возвращён, продлевать нечего — счёт №${b.order_number} аннулирован.`,
-      { event: 'extension.cancelled', dedupeKey: `extension.cancelled:${b.id}` });
+    const [title, why] = CHILD_BILL_TEXT[b.kind] || ['Счёт снят', 'Заказ закрыт'];
+    await notifyUser(b.user_id, b.id, 'info', title,
+      `${why} — счёт №${b.order_number} аннулирован.`,
+      { event: 'childbill.cancelled', dedupeKey: `childbill.cancelled:${b.id}` });
   }
   return closed;
 }
@@ -397,10 +404,29 @@ async function confirmPayment(rentalId, { method, paymentId, amountSum }) {
 
   // 1) Вызов курьера за арендованным инструментом
   if (rental.kind === 'courier_return') {
-    await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
-    if (rental.parent_rental_id) {
-      await supabase.from('rentals').update({ return_method: 'courier' }).eq('id', rental.parent_rental_id);
+    // ⚠️ ЕХАТЬ ЕСТЬ ЗА ЧЕМ, ТОЛЬКО ПОКА АРЕНДА ЖИВА. Счёт на вызов висит до
+    // оплаты, а метка return_method ставится лишь после неё — поэтому клиент
+    // мог тем временем сдать инструмент в бокс сам. Оплатив старый счёт после
+    // этого, он получал «курьер вызван» по уже возвращённой аренде: курьер
+    // ехал в пустоту, а деньги оставались у нас без услуги.
+    const { data: parent } = rental.parent_rental_id
+      ? await supabase.from('rentals').select('id, status, order_number').eq('id', rental.parent_rental_id).single()
+      : { data: null };
+    if (!parent || !['active', 'overdue'].includes(parent.status)) {
+      await supabase.from('rentals')
+        .update({ status: 'cancelled', cancelled_at: nowIso, refund_status: 'pending' })
+        .eq('id', rentalId);
+      await notifyUser(rental.user_id, rentalId, 'payment', 'Вызов курьера не состоится',
+        `${paidText} Инструмент уже возвращён, забирать нечего — деньги вернутся тем же способом оплаты в течение 1–3 рабочих дней.`,
+        paidKey('user'));
+      await notifyAdmin(
+        html`⚠️ <b>Оплата вызова курьера по закрытой аренде</b> №${rental.order_number} — ${fmt(amountSum)} сум к возврату в кассе ${rental.payment_provider}`,
+        paidKey('ops'));
+      return await loadRental(rentalId);
     }
+
+    await supabase.from('rentals').update({ status: 'pending_delivery', delivery_status: 'paid', paid_at: nowIso }).eq('id', rentalId);
+    await supabase.from('rentals').update({ return_method: 'courier' }).eq('id', parent.id);
     await notifyUser(rental.user_id, rentalId, 'payment', 'Курьер вызван',
       `${paidText} Курьер заберёт ${name}: ${rental.delivery_slot_label || 'в выбранное время'}.`, paidKey('user'));
     await notifyAdmin(
@@ -662,7 +688,7 @@ async function cancelOrder(rental, by = 'user') {
 
 module.exports = {
   getPricing, getDelivery, getSupport, getTerms, calculatePrice, overdueFeeFor, availableSlots, resolveSlot,
-  createPenalty, unpaidPenalties, cancelExtensionBills,
+  createPenalty, unpaidPenalties, cancelChildBills,
   RENTAL_FULL, loadRental, openLock, cellOf, openCellFor, notifyUser, notifyAdmin,
   takeStock, returnStock, returnStockOnce, claimCell, confirmPayment, pickupPurchase, cancelOrder, returnBonusById,
   describe, addressLine, fmt,

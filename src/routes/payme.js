@@ -76,12 +76,19 @@ async function expireIfNeeded(tx) {
     await supabase.from('payme_transactions')
       .update({ state: STATE_CANCELLED, reason: 4, cancel_time: cancelTime })
       .eq('id', tx.id);
-    await supabase.from('rentals')
+    const { data: expired } = await supabase.from('rentals')
       .update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
       .eq('id', tx.rental_id)
       .eq('status', 'pending_payment')
-      .neq('kind', 'penalty'); // штраф не аннулируется по таймауту транзакции
-    await orders.returnBonusById(tx.rental_id); // бонус не должен сгореть по таймауту
+      .neq('kind', 'penalty') // штраф не аннулируется по таймауту транзакции
+      .select('id');
+    // ⚠️ Бонус возвращаем ТОЛЬКО если заказ действительно отменился. Возврат
+    // шёл безусловно: протухшая попытка Payme по заказу, который человек тем
+    // временем оплатил через Click, возвращала списанный бонус на счёт —
+    // заказ живой, инструмент выдан, а деньги за него вернулись клиенту.
+    if (expired && expired.length) {
+      await orders.returnBonusById(tx.rental_id); // бонус не должен сгореть по таймауту
+    }
     return { ...tx, state: STATE_CANCELLED, reason: 4, cancel_time: cancelTime };
   }
   return tx;
@@ -237,9 +244,27 @@ async function cancelTransaction(params) {
     }
     await orders.returnBonusById(tx.rental_id); // отмена транзакции — возвращаем и бонус
     if (afterPay) await orders.returnStockOnce(rental);
-    // Ячейку освобождаем только по самому заказу; вызов курьера (courier_return) ячейкой не владеет
-    if (rental?.tools?.cells && rental.kind === 'rent') {
-      await supabase.from('cells').update({ status: 'free' }).eq('id', rental.tools.cell_id);
+    // ⚠️ ЯЧЕЙКУ ОСВОБОЖДАЕМ, ТОЛЬКО ЕСЛИ ЭТОТ ЗАКАЗ ЕЮ ВЛАДЕЛ. Условие было
+    // «аренда и у инструмента есть ячейка» — но ячейку занимает лишь оплата.
+    // Достаточно двух неоплаченных заказов на один инструмент: первый оплачен
+    // и человек им пользуется, по второму отменяется его неиспользованная
+    // Payme-попытка — и ячейка первого становилась свободной, а инструмент
+    // предлагался следующему клиенту. Владение даёт только afterPay: отмена
+    // после оплаты, то есть возврат денег по этому самому заказу.
+    if (afterPay && rental.kind === 'rent' && rental.tools?.cell_id) {
+      await supabase.from('cells')
+        .update({ status: 'free', pending_rental_id: null })
+        .eq('id', rental.tools.cell_id);
+    }
+    // ⚠️ Отменённый вызов курьера обязан снять метку с аренды. Обычная отмена
+    // её снимала, а отмена через Payme — нет: у аренды оставалось
+    // return_method='courier', и сдать инструмент в бокс становилось нельзя —
+    // курьер уже не приедет, а возврат запрещён.
+    if (rental.kind === 'courier_return' && rental.parent_rental_id) {
+      await supabase.from('rentals')
+        .update({ return_method: null })
+        .eq('id', rental.parent_rental_id)
+        .eq('return_method', 'courier');
     }
   }
   if (newState === STATE_CANCELLED_AFTER) {

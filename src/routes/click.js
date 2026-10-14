@@ -157,9 +157,21 @@ router.post('/complete', async (req, res) => {
   if (Number(p.error) < 0) {
     await supabase.from('click_transactions')
       .update({ state: ST_CANCELLED, cancel_time: Date.now() }).eq('id', tx.id);
-    await supabase.from('rentals').update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
-      .eq('id', tx.merchant_trans_id).eq('status', 'pending_payment');
-    await orders.returnBonusById(tx.merchant_trans_id); // иначе бонус сгорит вместе с заказом
+    // ⚠️ ШТРАФ НЕ АННУЛИРУЕТСЯ ОТКАЗОМ КАССЫ. Отменялся любой pending_payment,
+    // включая kind='penalty'. А новые аренды блокирует именно неоплаченный
+    // штраф в этом статусе: достаточно было начать оплату штрафа и получить
+    // от Click отрицательный Complete — долг исчезал, блокировка снималась,
+    // и клиент не заплатил ничего. Неудачная попытка — не прощение долга.
+    const { data: cancelled } = await supabase.from('rentals')
+      .update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
+      .eq('id', tx.merchant_trans_id).eq('status', 'pending_payment')
+      .neq('kind', 'penalty')
+      .select('id');
+    // Бонус возвращаем, только если заказ действительно отменился: иначе отказ
+    // одной кассы вернёт списанное по заказу, уже оплаченному через другую.
+    if (cancelled && cancelled.length) {
+      await orders.returnBonusById(tx.merchant_trans_id); // иначе бонус сгорит вместе с заказом
+    }
     return res.json({ ...base, merchant_confirm_id: tx.prepare_id, error: Number(p.error), error_note: 'Cancelled by Click' });
   }
   if (Math.round(Number(p.amount)) !== Math.round(Number(tx.amount))) {

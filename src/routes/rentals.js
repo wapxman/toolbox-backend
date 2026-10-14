@@ -596,7 +596,7 @@ router.post('/:id/return', async (req, res) => {
       .update({ status: 'pending_check', pending_rental_id: rental.id })
       .eq('id', rental.tools.cell_id);
     // Инструмент сдан — неоплаченные счета на продление больше ни к чему.
-    await orders.cancelExtensionBills(rental.id);
+    await orders.cancelChildBills(rental.id);
     const penalty = overdueFee > 0 ? await orders.createPenalty({ ...rental, order_number: updated.order_number }, overdueFee) : null;
     await orders.notifyUser(req.userId, rental.id, 'info',
       overdueFee > 0 ? 'Возвращён со штрафом' : 'Инструмент возвращён',
