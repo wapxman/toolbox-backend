@@ -163,6 +163,31 @@ function layoutSectors(prizes, target = 12) {
  * известны оба. Считаем ПО ОБОИМ сразу: иначе человек крутит гостем, заводит
  * аккаунт и получает вторую попытку на то же устройство.
  */
+/** Все аккаунты одного человека: текущий плюс все удалённые до него.
+ *
+ *  Удаление аккаунта не стирает человека — при повторной регистрации на тот же
+ *  номер заводится НОВАЯ строка со ссылкой previous_user_id на старую. Без
+ *  обхода этой цепочки попытка выдавалась бы заново после каждого удаления
+ *  профиля, и главный приз доставался бы тому, кто упорнее удаляет аккаунт.
+ */
+async function accountChain(userId) {
+  const ids = [];
+  let cur = userId;
+  // Ограничение на глубину — страховка от кольца в данных, а не от длинной
+  // истории: двадцати перерегистраций хватает с запасом.
+  for (let i = 0; cur && i < 20; i++) {
+    if (ids.includes(cur)) break;
+    ids.push(cur);
+    const { data } = await supabase
+      .from('users')
+      .select('previous_user_id')
+      .eq('id', cur)
+      .maybeSingle();
+    cur = data && data.previous_user_id;
+  }
+  return ids;
+}
+
 async function spinsLeft(owner, cfg) {
   const userId = owner && owner.userId;
   const deviceId = owner && owner.deviceId;
@@ -175,10 +200,12 @@ async function spinsLeft(owner, cfg) {
 
   // PostgREST: «или» по двум колонкам. Пустую сторону не добавляем, иначе
   // условие станет `device_id=eq.null` и перестанет совпадать с чем-либо.
-  if (userId && deviceId) {
-    q = q.or(`user_id.eq.${userId},device_id.eq.${deviceId}`);
-  } else if (userId) {
-    q = q.eq('user_id', userId);
+  // По аккаунту считаем всю цепочку перерегистраций, а не только текущий id.
+  const ids = userId ? await accountChain(userId) : [];
+  if (ids.length && deviceId) {
+    q = q.or(`user_id.in.(${ids.join(',')}),device_id.eq.${deviceId}`);
+  } else if (ids.length) {
+    q = q.in('user_id', ids);
   } else {
     q = q.eq('device_id', deviceId);
   }
@@ -439,5 +466,5 @@ async function refund(userId, rentalId) {
 module.exports = {
   DEFAULTS, SETTINGS_KEY, getConfig, dropCache,
   balanceOf, applicable, drawPrize, layoutSectors,
-  winnersCount, promoState, spinsLeft, spin, claimFor, spend, refund,
+  winnersCount, promoState, accountChain, spinsLeft, spin, claimFor, spend, refund,
 };
