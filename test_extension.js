@@ -80,10 +80,19 @@ const check = (name, got, want) => {
     items_price: 100000, total_price: 100000, bonus_applied: 0,
     started_at: iso(now), expected_end: iso(now),
   });
-  const closed = await orders.cancelExtensionBills(rent2.id);
+  // Вместе со счётом на продление возврат обязан гасить и неоплаченный вызов
+  // курьера: ехать уже не за чем.
+  const courier2 = await mk({
+    kind: 'courier_return', status: 'pending_payment', parent_rental_id: rent2.id, days: 0,
+    items_price: 50000, total_price: 50000, bonus_applied: 0,
+    started_at: iso(now), expected_end: iso(now),
+  });
+  const closed = await orders.cancelChildBills(rent2.id);
   const { data: b2 } = await supabase.from('rentals').select('status').eq('id', bill2.id).single();
-  check('счетов снято', closed, 1);
+  const { data: c2 } = await supabase.from('rentals').select('status').eq('id', courier2.id).single();
+  check('счетов снято', closed, 2);
   check('счёт на продление отменён', b2.status, 'cancelled');
+  check('вызов курьера отменён', c2.status, 'cancelled');
 
   // ── В. Оплата продления по ЗАКРЫТОЙ аренде ──────────────────────────────────
   console.log('\n━━ В. Оплата продления после возврата ━━');
@@ -104,6 +113,25 @@ const check = (name, got, want) => {
   check('срок по сданной аренде не уехал', p3.expected_end, rent3.expected_end);
   check('счёт отменён', b3.status, 'cancelled');
   check('деньги помечены к возврату', b3.refund_status, 'pending');
+
+  // ── Г. Оплата вызова курьера после возврата ────────────────────────────────
+  console.log('\n━━ Г. Оплата вызова курьера после возврата ━━');
+  const rent4 = await mk({
+    kind: 'rent', status: 'completed', days: 2, items_price: 100000, total_price: 100000,
+    started_at: iso(now - 3 * D), expected_end: iso(now - D), actual_end: iso(now - D), paid_at: iso(now - 3 * D),
+  });
+  const call4 = await mk({
+    kind: 'courier_return', status: 'pending_payment', parent_rental_id: rent4.id, days: 0,
+    items_price: 50000, total_price: 50000, bonus_applied: 0,
+    started_at: iso(now), expected_end: iso(now),
+  });
+  await orders.confirmPayment(call4.id, { method: 'payme', paymentId: 'test-cr-' + now, amountSum: 50000 });
+  const { data: p4 } = await supabase.from('rentals').select('status, return_method').eq('id', rent4.id).single();
+  const { data: c4 } = await supabase.from('rentals').select('status, refund_status').eq('id', call4.id).single();
+  check('курьер не объявлен по сданной аренде', p4.return_method || 'нет', 'нет');
+  check('сданная аренда не ожила', p4.status, 'completed');
+  check('счёт на курьера отменён', c4.status, 'cancelled');
+  check('деньги за курьера к возврату', c4.refund_status, 'pending');
 
   // ── уборка ──────────────────────────────────────────────────────────────────
   // Снимаем ссылки в обратном порядке: сперва всё, что ссылается на заказы,
