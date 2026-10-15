@@ -23,10 +23,11 @@ router.get('/', optionalAuth, async (req, res) => {
   try {
     const cfg = await wheel.getConfig();
     const deviceId = deviceOf(req);
-    const [left, balance, state] = await Promise.all([
+    const [left, balance, state, pendingPrize] = await Promise.all([
       wheel.spinsLeft({ userId: req.userId, deviceId }, cfg),
       req.userId ? wheel.balanceOf(req.userId) : Promise.resolve(0),
       wheel.promoState(cfg),
+      wheel.pendingPrizeOf({ deviceId }),
     ]);
     res.json({
       // Акция «включена» только если идёт на самом деле: срок не вышел и
@@ -46,6 +47,10 @@ router.get('/', optionalAuth, async (req, res) => {
       // Гостю приз зачислится только после регистрации. Приложение обязано
       // сказать об этом ДО прокрутки, иначе выйдет ловушка.
       requires_account: !req.userId,
+      // Выигрыш, сделанный с этого устройства и не забранный: гость потерял
+      // диалог или вошёл обычным входом. Приложение по нему восстанавливает
+      // путь «Забрать приз» (F19).
+      pending_prize: pendingPrize,
       // Правила акции для экрана «Правила». Требование Apple 5.3.2 и Google
       // Play (Gamified Loyalty Programs): фиксированное число победителей,
       // дедлайн участия и срок выдачи приза должны быть видны в приложении.

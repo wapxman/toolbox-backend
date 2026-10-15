@@ -349,6 +349,29 @@ async function spin(owner) {
   };
 }
 
+/** Выигрыш, который уже сделан с этого устройства, но ещё не забран.
+ *
+ *  Нужен экрану колеса: гость выиграл, потерял диалог (перезапуск, обычный
+ *  вход вместо регистрации из диалога) — и штатного пути «забрать» не
+ *  оставалось, хотя сервер прокрутку помнит (F19). Отдаём самую раннюю.
+ */
+async function pendingPrizeOf({ deviceId }) {
+  if (!deviceId) return null;
+  const { data, error } = await supabase
+    .from('wheel_spins')
+    .select('prize_code, prize_label, amount, kind')
+    .eq('device_id', deviceId)
+    .is('user_id', null)
+    .is('claimed_at', null)
+    .neq('status', 'cancelled')
+    .order('created_at', { ascending: true })
+    .limit(1);
+  if (error) { console.error('pendingPrizeOf:', error.message); return null; }
+  const row = (data || [])[0];
+  if (!row) return null;
+  return { code: row.prize_code, label: row.prize_label, kind: row.kind, amount: Number(row.amount || 0) };
+}
+
 /** Забрать выигрыши, накрученные этим устройством до регистрации.
  *
  *  Зовётся сразу после входа. Берёт прокрутки устройства без владельца,
@@ -504,6 +527,6 @@ async function refund(userId, rentalId) {
 module.exports = {
   DEFAULTS, SETTINGS_KEY, getConfig, dropCache,
   balanceOf, applicable, drawPrize, layoutSectors,
-  winnersCount, promoState, accountChain, spinsLeft, spin, claimFor,
+  winnersCount, promoState, accountChain, spinsLeft, spin, claimFor, pendingPrizeOf,
   expiringSoon, spend, refund,
 };

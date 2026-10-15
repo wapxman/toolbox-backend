@@ -413,6 +413,47 @@ router.post('/:id/pickup', async (req, res) => {
   }
 });
 
+// POST /api/rentals/:id/open-cell — открыть ячейку заказа по просьбе клиента.
+// Нужна экрану «Открываем ячейку» после оплаты и кнопке в активной аренде:
+// первое открытие делает сервер при активации, но дверь могла не открыться
+// или уже захлопнуться — а честный повтор пользователю был недоступен (F18).
+// Покупка из бокса идёт через pickupPurchase: там своя проверка готовности.
+router.post('/:id/open-cell', async (req, res) => {
+  try {
+    const rental = await orders.loadRental(req.params.id);
+    if (!rental || rental.user_id !== req.userId) return res.status(404).json({ error: 'Заказ не найден' });
+    if (rental.fulfillment === 'delivery') return res.status(400).json({ error: 'Этот заказ доставляет курьер — ячейки у него нет' });
+    if (rental.kind === 'buy') {
+      const r = await orders.pickupPurchase(rental);
+      if (r.error) return res.status(r.lock_failed ? 503 : 400).json({ error: r.error, lock_failed: !!r.lock_failed });
+      return res.json({ ok: true, cell_number: r.cell_number });
+    }
+    if (!['active', 'overdue'].includes(rental.status)) {
+      return res.status(400).json({ error: rental.status === 'pending_payment'
+        ? 'Заказ ещё не оплачен' : 'Аренда завершена — ячейка уже недоступна' });
+    }
+    const cell = orders.cellOf(rental);
+    if (!cell) return res.status(400).json({ error: 'За заказом не числится ячейка — напишите в поддержку' });
+    try {
+      await orders.openCellFor(rental);
+    } catch (e) {
+      // Замок не ответил. Клиент стоит у бокса — зовём оператора, а не молчим.
+      console.error('client open-cell failed:', e.message);
+      await orders.notifyAdmin(
+        `⚠️ Клиент не смог открыть ячейку ${cell.cell_number} по заказу №${rental.order_number}: ${e.message}`,
+        { event: 'cell.open_failed', dedupeKey: `cell.open_failed:${rental.id}:${Math.floor(Date.now() / 600000)}` });
+      return res.status(503).json({
+        error: 'Замок не ответил. Попробуйте ещё раз через минуту — оператор уже уведомлён.',
+        lock_failed: true,
+      });
+    }
+    res.json({ ok: true, cell_number: cell.cell_number });
+  } catch (err) {
+    console.error('open-cell error:', err);
+    res.status(500).json({ error: 'Ошибка открытия ячейки' });
+  }
+});
+
 // POST /api/rentals/:id/cancel — отмена клиентом (до передачи курьеру)
 router.post('/:id/cancel', async (req, res) => {
   try {
