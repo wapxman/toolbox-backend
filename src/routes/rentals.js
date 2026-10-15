@@ -210,9 +210,27 @@ router.post('/', async (req, res) => {
       }
       if (spent !== bonusWanted) {
         const fixedTotal = itemsPrice - discount + deliveryFee - spent;
-        await supabase.from('rentals')
+        // ⚠️ Поправка счёта обязана пройти. Если она молча падала, заказ
+        // оставался со скидкой, которой не соответствует списание: клиент
+        // платил меньше, бонус не тратился (или наоборот). Не поправилось —
+        // заказ отменяем целиком, списанное возвращаем, человека просим
+        // оформить заново. Честный отказ дешевле тихо разъехавшегося счёта.
+        const { data: fixedRow, error: fixErr } = await supabase.from('rentals')
           .update({ bonus_applied: spent, total_price: fixedTotal })
-          .eq('id', rental.id);
+          .eq('id', rental.id)
+          .select('id');
+        if (fixErr || !fixedRow || !fixedRow.length) {
+          console.error('bonus fix failed:', fixErr?.message || 'заказ не найден');
+          await supabase.from('rentals')
+            .update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
+            .eq('id', rental.id)
+            .eq('status', 'pending_payment');
+          await orders.returnBonusById(rental.id); // вернуть списанное, если успело списаться
+          await orders.notifyAdmin(
+            `⚠️ Заказ №${rental.order_number} отменён при создании: бонус списался на ${spent}, а счёт не поправился. Клиенту предложено оформить заново.`,
+            { event: 'order.bonus_mismatch', dedupeKey: `order.bonus_mismatch:${rental.id}` });
+          return res.status(500).json({ error: 'Не получилось применить бонус. Оформите заказ ещё раз.' });
+        }
         rental.bonus_applied = spent;
         rental.total_price = fixedTotal;
       }
