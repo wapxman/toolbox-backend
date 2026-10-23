@@ -238,41 +238,6 @@ async function winnersCount() {
   return Number(count || 0);
 }
 
-/** Номер для чужих глаз: виден код оператора и две последние цифры. Этого хватает,
- *  чтобы лента победителей выглядела живой, и мало, чтобы по ней найти человека. */
-function maskPhone(phone) {
-  const d = String(phone || '').replace(/\D/g, '');
-  if (d.length < 7) return null;
-  return `+${d.slice(0, 3)} ${d.slice(3, 5)} ••• •• ${d.slice(-2)}`;
-}
-
-/** Последние выигрыши для ленты «Кто что выиграл». Те же правила, что у
- *  winnersCount: только призы с владельцем; удалённые аккаунты не показываем. */
-async function recentWinners(limit = 10) {
-  const { data: spins, error } = await supabase
-    .from('wheel_spins')
-    .select('user_id, prize_label, kind, created_at')
-    .not('user_id', 'is', null)
-    .neq('status', 'cancelled')
-    .order('created_at', { ascending: false })
-    .limit(limit * 2);
-  if (error) throw new Error('не удалось загрузить победителей: ' + error.message);
-  if (!spins.length) return [];
-
-  const ids = [...new Set(spins.map((s) => s.user_id))];
-  const { data: users, error: uErr } = await supabase
-    .from('users')
-    .select('id, phone, deleted_at')
-    .in('id', ids);
-  if (uErr) throw new Error('не удалось загрузить победителей: ' + uErr.message);
-  const phones = new Map(users.filter((u) => !u.deleted_at).map((u) => [u.id, u.phone]));
-
-  return spins
-    .map((s) => ({ who: maskPhone(phones.get(s.user_id)), prize: s.prize_label, kind: s.kind, at: s.created_at }))
-    .filter((w) => w.who)
-    .slice(0, limit);
-}
-
 /** Идёт ли акция прямо сейчас: включена, срок не вышел, победители не кончились.
  *  Возвращает { open, reason, winners, winnersLimit, endsAt }. */
 async function promoState(cfg) {
@@ -562,6 +527,6 @@ async function refund(userId, rentalId) {
 module.exports = {
   DEFAULTS, SETTINGS_KEY, getConfig, dropCache,
   balanceOf, applicable, drawPrize, layoutSectors,
-  winnersCount, recentWinners, maskPhone, promoState, accountChain, spinsLeft, spin, claimFor, pendingPrizeOf,
+  winnersCount, promoState, accountChain, spinsLeft, spin, claimFor, pendingPrizeOf,
   expiringSoon, spend, refund,
 };
