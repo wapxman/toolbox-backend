@@ -69,6 +69,19 @@ router.get('/', optionalAuth, async (req, res) => {
   }
 });
 
+// GET /api/wheel/winners — лента «Кто что выиграл». Открыта и гостю: она для того
+// и нужна, чтобы человек до регистрации увидел, что выигрывают живые люди.
+router.get('/winners', async (req, res) => {
+  try {
+    const limit = Math.min(20, Math.max(1, Number(req.query.limit) || 10));
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({ winners: await wheel.recentWinners(limit) });
+  } catch (err) {
+    console.error('wheel winners error:', err);
+    res.status(500).json({ error: 'Не удалось загрузить победителей' });
+  }
+});
+
 // POST /api/wheel/spin — крутить. Приз выбирает сервер.
 // Гостю тоже можно: выигрыш запишется за устройством и дождётся регистрации.
 router.post('/spin', optionalAuth, async (req, res) => {
